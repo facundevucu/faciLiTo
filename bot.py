@@ -2,6 +2,7 @@ import os
 import json
 import re
 import traceback
+import unicodedata
 import requests
 import anthropic
 import sqlite3
@@ -47,6 +48,7 @@ VEHICULOS = {
     "particular": "Particular",
 }
 VEHICLE_TIMEOUT = 600  # 10 minutes
+CHOFER_TIMEOUT  = 600  # 10 minutes
 
 # sender → {parsed, derived, existing_id, existing_total}
 PENDING_REPLACEMENTS: dict = {}
@@ -54,6 +56,8 @@ PENDING_REPLACEMENTS: dict = {}
 PENDING_EMPRESA: dict = {}
 # sender → {parsed, derived, ts}  (waiting for vehicle selection)
 PENDING_VEHICLE: dict = {}
+# sender → {parsed, fecha_str, matches, ts}  (waiting for chofer disambiguation)
+PENDING_CHOFER: dict = {}
 
 BOT_TOOLS = [
     {
@@ -202,6 +206,8 @@ def _build_image_prompt() -> str:
         "IMPORTANTE sobre los montos: en Uruguay el punto es separador de miles y la coma es decimal.\n"
         'Ejemplos de conversión: "6.000" = 6000, "1.500" = 1500, "12.350,50" = 12350.5, "500" = 500.\n'
         "Convertí todos los montos a números sin separadores de miles.\n\n"
+        "IMPORTANTE: el campo 'efectivo_empresa' debe leerse directamente del campo 'EFECTIVO EMPRESA' "
+        "de la imagen. No lo calcules ni lo deduzcas — copiá el valor tal como aparece en la planilla.\n\n"
         "Respondé SOLO con un JSON con esta estructura exacta (usá null para campos vacíos o ilegibles):\n"
         f"{json_str}\n\n"
         "Si la imagen no es un formulario de recaudación o no podés extraer datos básicos respondé:\n"
@@ -654,6 +660,29 @@ def process_text(message_text: str) -> tuple:
 
 # ── message handlers ──────────────────────────────────────────────────────────
 
+def _normalize(s: str) -> str:
+    s = unicodedata.normalize("NFD", s.upper().strip())
+    return "".join(c for c in s if unicodedata.category(c) != "Mn")
+
+
+def _match_choferes(nombre: str) -> list:
+    """Returns active chofer names that share at least one word with `nombre`."""
+    if not nombre:
+        return []
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT nombre FROM choferes WHERE activo=1")
+    todos = [row[0] for row in c.fetchall()]
+    conn.close()
+    palabras_input = set(_normalize(nombre).split())
+    matches = []
+    for chofer in todos:
+        palabras_chofer = set(_normalize(chofer).split())
+        if palabras_input & palabras_chofer:
+            matches.append(chofer)
+    return matches
+
+
 def _get_canonical_chofer(nombre: str) -> str | None:
     if not nombre:
         return None
@@ -950,20 +979,20 @@ def _do_update(record_id: int, parsed: dict, derived: dict):
 
 
 def _confirmation_msg(parsed: dict, derived: dict, verb: str) -> str:
-    chofer   = parsed.get("chofer") or "sin nombre"
-    fecha    = parsed.get("fecha") or "?"
-    dia      = derived["dia_semana"] or ""
-    total    = parsed.get("total_recaudado") or 0
-    neto     = derived["efectivo_neto"] or 0
-    pos      = parsed.get("total_pos") or 0
-    pct      = derived["porcentaje_digital"] or 0
-    vehiculo = parsed.get("vehiculo") or "sin asignar"
+    chofer     = parsed.get("chofer") or "sin nombre"
+    fecha      = parsed.get("fecha") or "?"
+    dia        = derived["dia_semana"] or ""
+    total      = parsed.get("total_recaudado") or 0
+    ef_empresa = parsed.get("efectivo_empresa") or 0
+    pos        = parsed.get("total_pos") or 0
+    pct        = derived["porcentaje_digital"] or 0
+    vehiculo   = parsed.get("vehiculo") or "sin asignar"
     return (
         f"{verb} {fecha} ({dia})\n"
         f"Chofer: {chofer}\n"
         f"Vehículo: {vehiculo}\n"
         f"Total: ${total:.0f}\n"
-        f"Efectivo neto: ${neto:.0f}\n"
+        f"Efectivo empresa: ${ef_empresa:.0f}\n"
         f"POS: ${pos:.0f} ({pct:.1f}%)"
     )
 
@@ -994,16 +1023,32 @@ def _handle_image(sender: str, message: dict):
 
         fecha_str  = parsed.get("fecha", "")
         chofer_raw = parsed.get("chofer")
-        canonical  = _get_canonical_chofer(chofer_raw)
-        if chofer_raw and canonical is None:
-            log.warning(f"Chofer no registrado '{chofer_raw}' rechazado para {_mask(sender)}")
-            send_whatsapp_message(sender, (
-                f"El chofer {chofer_raw} no está registrado.\n"
-                f"Si es nuevo respondé CHOFER NUEVO {chofer_raw} para agregarlo."
-            ))
-            return
-        if canonical:
-            parsed["chofer"] = canonical
+        if chofer_raw:
+            matches = _match_choferes(chofer_raw)
+            if len(matches) == 0:
+                log.warning(f"Chofer no registrado '{chofer_raw}' para {_mask(sender)}")
+                send_whatsapp_message(sender, (
+                    f"El chofer {chofer_raw} no está registrado.\n"
+                    f"Si es nuevo respondé CHOFER NUEVO {chofer_raw} para agregarlo."
+                ))
+                return
+            elif len(matches) == 1:
+                log.info(f"Chofer '{chofer_raw}' resuelto a '{matches[0]}' para {_mask(sender)}")
+                parsed["chofer"] = matches[0]
+            else:
+                lista = "\n".join(f"{i+1} - {m}" for i, m in enumerate(matches))
+                log.warning(f"Chofer ambiguo '{chofer_raw}' — {len(matches)} matches para {_mask(sender)}")
+                PENDING_CHOFER[sender] = {
+                    "parsed": parsed,
+                    "fecha_str": fecha_str,
+                    "matches": matches,
+                    "ts": time.time(),
+                }
+                send_whatsapp_message(sender, (
+                    f"Encontré varios choferes con ese nombre:\n{lista}\n\n"
+                    f"¿A cuál pertenece esta recaudación? Respondé con el número."
+                ))
+                return
 
         derived = _derive_fields(fecha_str, parsed)
 
@@ -1028,6 +1073,38 @@ def _handle_image(sender: str, message: dict):
 
 def _handle_text(sender: str, message: dict):
     text = message["text"]["body"].strip()
+
+    # Handle pending chofer disambiguation
+    if sender in PENDING_CHOFER:
+        pending = PENDING_CHOFER[sender]
+        if time.time() - pending["ts"] > CHOFER_TIMEOUT:
+            PENDING_CHOFER.pop(sender)
+            log.info(f"Selección de chofer expirada para {_mask(sender)}")
+            send_whatsapp_message(sender, "La selección de chofer expiró. Mandá la imagen nuevamente.")
+            return
+        matches = pending["matches"]
+        lista   = "\n".join(f"{i+1} - {m}" for i, m in enumerate(matches))
+        try:
+            idx = int(text.strip()) - 1
+            if not (0 <= idx < len(matches)):
+                raise ValueError
+        except ValueError:
+            send_whatsapp_message(sender, f"Respondé con el número del chofer:\n{lista}")
+            return
+        PENDING_CHOFER.pop(sender)
+        parsed            = pending["parsed"]
+        parsed["chofer"]  = matches[idx]
+        log.info(f"Chofer seleccionado '{matches[idx]}' para {_mask(sender)}")
+        derived = _derive_fields(pending["fecha_str"], parsed)
+        PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
+        total = parsed.get("total_recaudado") or 0
+        fecha = parsed.get("fecha") or "?"
+        send_whatsapp_message(sender, (
+            f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
+            f"¿A qué vehículo pertenece?\n"
+            f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
+        ))
+        return
 
     # Handle pending vehicle selection
     if sender in PENDING_VEHICLE:
