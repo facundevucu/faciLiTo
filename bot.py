@@ -60,6 +60,8 @@ PENDING_VEHICLE: dict = {}
 PENDING_CHOFER: dict = {}
 # sender → {parsed, fecha_str, ts}  (waiting for user to provide unreadable chofer name)
 PENDING_CHOFER_NAME: dict = {}
+# sender → {parsed, fecha_str, nombre, ts}  (waiting for user to confirm OCR-read chofer name)
+PENDING_CHOFER_OCR: dict = {}
 # sender → {parsed, fecha_str, nombre, ts}  (waiting for SI/NO to register a new chofer)
 PENDING_CHOFER_CONFIRM: dict = {}
 # sender → {parsed, derived, ts}  (waiting for pre-save confirmation / field corrections)
@@ -1192,6 +1194,30 @@ def _send_confirm_interactive(sender: str, parsed: dict, derived: dict, modified
     )
 
 
+def _resolve_chofer_and_continue(sender: str, parsed: dict, fecha_str: str, nombre: str):
+    matches = _match_choferes(nombre)
+    if len(matches) == 0:
+        log.warning(f"Chofer no registrado '{nombre}' para {_mask(sender)}")
+        PENDING_CHOFER_CONFIRM[sender] = {
+            "parsed": parsed, "fecha_str": fecha_str, "nombre": nombre, "ts": time.time(),
+        }
+        _send_chofer_confirm_buttons(sender, nombre)
+    elif len(matches) == 1:
+        log.info(f"Chofer '{nombre}' resuelto a '{matches[0]}' para {_mask(sender)}")
+        parsed["chofer"] = matches[0]
+        derived = _derive_fields(fecha_str, parsed)
+        PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
+        total = parsed.get("total_recaudado") or 0
+        fecha = parsed.get("fecha") or "?"
+        _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
+    else:
+        log.warning(f"Chofer ambiguo '{nombre}' — {len(matches)} matches para {_mask(sender)}")
+        PENDING_CHOFER[sender] = {
+            "parsed": parsed, "fecha_str": fecha_str, "matches": matches, "ts": time.time(),
+        }
+        _send_chofer_disambiguation_list(sender, matches)
+
+
 def _handle_image(sender: str, message: dict):
     image_id = message["image"]["id"]
     try:
@@ -1232,42 +1258,16 @@ def _handle_image(sender: str, message: dict):
             ))
             return
         if chofer_raw:
-            matches = _match_choferes(chofer_raw)
-            if len(matches) == 0:
-                log.warning(f"Chofer no registrado '{chofer_raw}' para {_mask(sender)}")
-                PENDING_CHOFER_CONFIRM[sender] = {
-                    "parsed": parsed,
-                    "fecha_str": fecha_str,
-                    "nombre": chofer_raw,
-                    "ts": time.time(),
-                }
-                _send_chofer_confirm_buttons(sender, chofer_raw)
-                return
-            elif len(matches) == 1:
-                log.info(f"Chofer '{chofer_raw}' resuelto a '{matches[0]}' para {_mask(sender)}")
-                parsed["chofer"] = matches[0]
-            else:
-                log.warning(f"Chofer ambiguo '{chofer_raw}' — {len(matches)} matches para {_mask(sender)}")
-                PENDING_CHOFER[sender] = {
-                    "parsed": parsed,
-                    "fecha_str": fecha_str,
-                    "matches": matches,
-                    "ts": time.time(),
-                }
-                _send_chofer_disambiguation_list(sender, matches)
-                return
-
-        derived = _derive_fields(fecha_str, parsed)
-
-        PENDING_VEHICLE[sender] = {
-            "parsed": parsed,
-            "derived": derived,
-            "ts": time.time(),
-        }
-        total = parsed.get("total_recaudado") or 0
-        fecha = parsed.get("fecha") or "?"
-        log.info(f"Imagen procesada para {_mask(sender)}: ${total:.0f} del {fecha} — esperando vehículo")
-        _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
+            log.info(f"Chofer OCR '{chofer_raw}' para {_mask(sender)} — esperando confirmación")
+            PENDING_CHOFER_OCR[sender] = {
+                "parsed": parsed, "fecha_str": fecha_str, "nombre": chofer_raw, "ts": time.time(),
+            }
+            send_interactive_buttons(
+                sender,
+                f"Leí el nombre del chofer como: *{chofer_raw}*\n¿Es correcto?",
+                [{"id": "SI", "title": "✅ Sí"}, {"id": "NO", "title": "✏️ No, corregir"}],
+            )
+            return
 
     except Exception as e:
         log.error(f"Error procesando imagen de {_mask(sender)}: {e}\n{traceback.format_exc()}")
@@ -1415,34 +1415,39 @@ def _handle_text(sender: str, message: dict):
         PENDING_CHOFER_NAME.pop(sender)
         parsed    = pending["parsed"]
         fecha_str = pending["fecha_str"]
-        matches   = _match_choferes(text.strip())
-        if len(matches) == 0:
-            nombre = text.strip()
-            log.warning(f"Chofer ingresado '{nombre}' no registrado para {_mask(sender)}")
-            PENDING_CHOFER_CONFIRM[sender] = {
-                "parsed": parsed,
-                "fecha_str": fecha_str,
-                "nombre": nombre,
-                "ts": time.time(),
-            }
-            _send_chofer_confirm_buttons(sender, nombre)
-        elif len(matches) == 1:
-            parsed["chofer"] = matches[0]
-            log.info(f"Chofer ingresado resuelto a '{matches[0]}' para {_mask(sender)}")
-            derived = _derive_fields(fecha_str, parsed)
-            PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
-            total = parsed.get("total_recaudado") or 0
-            fecha = parsed.get("fecha") or "?"
-            _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
+        log.info(f"Nombre de chofer ingresado por {_mask(sender)}: '{text.strip()}'")
+        _resolve_chofer_and_continue(sender, parsed, fecha_str, text.strip())
+        return
+
+    # Handle pending chofer OCR name confirmation (was the OCR-read name correct?)
+    if sender in PENDING_CHOFER_OCR:
+        pending = PENDING_CHOFER_OCR[sender]
+        if time.time() - pending["ts"] > CHOFER_TIMEOUT:
+            PENDING_CHOFER_OCR.pop(sender)
+            log.info(f"Confirmación de nombre OCR expirada para {_mask(sender)}")
+            send_whatsapp_message(sender, "La espera expiró. Mandá la imagen nuevamente.")
+            return
+        respuesta = text.upper().strip()
+        if respuesta in RESPUESTAS_AFIRMATIVAS:
+            PENDING_CHOFER_OCR.pop(sender)
+            parsed    = pending["parsed"]
+            fecha_str = pending["fecha_str"]
+            nombre    = pending["nombre"]
+            log.info(f"Nombre OCR '{nombre}' confirmado por {_mask(sender)}")
+            _resolve_chofer_and_continue(sender, parsed, fecha_str, nombre)
+        elif respuesta == "NO":
+            PENDING_CHOFER_OCR.pop(sender)
+            parsed    = pending["parsed"]
+            fecha_str = pending["fecha_str"]
+            PENDING_CHOFER_NAME[sender] = {"parsed": parsed, "fecha_str": fecha_str, "ts": time.time()}
+            send_whatsapp_message(sender, "¿Cuál es el nombre correcto del chofer?")
         else:
-            log.warning(f"Chofer ambiguo '{text.strip()}' — {len(matches)} matches para {_mask(sender)}")
-            PENDING_CHOFER[sender] = {
-                "parsed": parsed,
-                "fecha_str": fecha_str,
-                "matches": matches,
-                "ts": time.time(),
-            }
-            _send_chofer_disambiguation_list(sender, matches)
+            nombre = pending["nombre"]
+            send_interactive_buttons(
+                sender,
+                f"Leí el nombre del chofer como: *{nombre}*\n¿Es correcto?",
+                [{"id": "SI", "title": "✅ Sí"}, {"id": "NO", "title": "✏️ No, corregir"}],
+            )
         return
 
     # Handle pending new chofer confirmation (SI to add / NO to cancel)
