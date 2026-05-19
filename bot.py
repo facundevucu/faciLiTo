@@ -596,6 +596,59 @@ def send_whatsapp_message(to: str, message: str) -> bool:
         return False
 
 
+def send_interactive_buttons(to: str, body: str, buttons: list[dict]) -> bool:
+    """buttons: [{"id": "...", "title": "..."}] — max 3, title max 20 chars"""
+    url     = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    data    = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "button",
+            "body": {"text": body},
+            "action": {"buttons": [
+                {"type": "reply", "reply": {"id": b["id"], "title": b["title"]}}
+                for b in buttons
+            ]},
+        },
+    }
+    try:
+        r = requests.post(url, headers=headers, json=data, timeout=10)
+        r.raise_for_status()
+        log.info(f"Botones interactivos enviados a {_mask(to)} — HTTP {r.status_code}")
+        return True
+    except requests.RequestException as e:
+        log.error(f"Error enviando botones a {_mask(to)}: {e}")
+        send_whatsapp_message(to, body)
+        return False
+
+
+def send_interactive_list(to: str, body: str, button_label: str, sections: list[dict]) -> bool:
+    """sections: [{"title": "...", "rows": [{"id":"...","title":"...","description":"..."}]}]"""
+    url     = f"https://graph.facebook.com/v18.0/{PHONE_NUMBER_ID}/messages"
+    headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+    data    = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "interactive",
+        "interactive": {
+            "type": "list",
+            "body": {"text": body},
+            "action": {"button": button_label, "sections": sections},
+        },
+    }
+    try:
+        r = requests.post(url, headers=headers, json=data, timeout=10)
+        r.raise_for_status()
+        log.info(f"Lista interactiva enviada a {_mask(to)} — HTTP {r.status_code}")
+        return True
+    except requests.RequestException as e:
+        log.error(f"Error enviando lista a {_mask(to)}: {e}")
+        send_whatsapp_message(to, body)
+        return False
+
+
 # ── Claude ────────────────────────────────────────────────────────────────────
 
 def process_image(image_url: str) -> str:
@@ -1044,9 +1097,7 @@ def _build_confirm_msg(parsed: dict, derived: dict, modified_field: str = None) 
         f"{total_icon} {_e('total_recaudado')}Total: ${total:.0f}{total_suffix}\n"
         f"🏦 {_e('efectivo_empresa')}Efectivo empresa: ${ef_emp:.0f}\n"
         f"💳 POS: ${pos:.0f}\n\n"
-        f"¿Todo correcto? Respondé:\n"
-        f"✅ SI para guardar\n"
-        f"🔢 Cualquier número si algo está mal"
+        f"¿Todo correcto? Respondé *SI* para guardar, un número para corregir o *CANCELAR*."
     )
 
 
@@ -1066,6 +1117,68 @@ def _confirmation_msg(parsed: dict, derived: dict, verb: str) -> str:
         f"Total: ${total:.0f}\n"
         f"Efectivo empresa: ${ef_empresa:.0f}\n"
         f"POS: ${pos:.0f} ({pct:.1f}%)"
+    )
+
+
+def _send_vehicle_list(sender: str, header: str):
+    send_interactive_list(
+        sender, header, "Seleccionar",
+        [{"title": "Vehículos", "rows": [
+            {"id": "1", "title": "Terminal"},
+            {"id": "2", "title": "Plaza"},
+            {"id": "3", "title": "Sanatorio"},
+            {"id": "4", "title": "Particular"},
+        ]}],
+    )
+
+
+def _send_chofer_confirm_buttons(sender: str, nombre: str):
+    send_interactive_buttons(
+        sender,
+        f"El chofer *{nombre}* no está registrado. ¿Querés agregarlo al sistema?",
+        [{"id": "SI", "title": "✅ Sí, agregar"}, {"id": "NO", "title": "❌ No"}],
+    )
+
+
+def _send_chofer_disambiguation_list(sender: str, matches: list):
+    rows = [{"id": str(i + 1), "title": m} for i, m in enumerate(matches)]
+    send_interactive_list(
+        sender,
+        "Encontré varios choferes con ese nombre. ¿A cuál pertenece esta recaudación?",
+        "Ver choferes",
+        [{"title": "Choferes", "rows": rows}],
+    )
+
+
+def _send_field_select_interactive(sender: str, parsed: dict):
+    _fecha = parsed.get("fecha") or "?"
+    _total = parsed.get("total_recaudado") or 0
+    _ef    = parsed.get("efectivo_empresa") or 0
+    _chof  = parsed.get("chofer") or "sin nombre"
+    _veh   = parsed.get("vehiculo") or "sin asignar"
+    send_interactive_list(
+        sender,
+        "¿Qué campo querés corregir?",
+        "Ver campos",
+        [{"title": "Campos", "rows": [
+            {"id": "1", "title": "Fecha",       "description": str(_fecha)},
+            {"id": "2", "title": "Total",       "description": f"${_total:.0f}"},
+            {"id": "3", "title": "Ef. empresa", "description": f"${_ef:.0f}"},
+            {"id": "4", "title": "Chofer",      "description": str(_chof)},
+            {"id": "5", "title": "Vehículo",    "description": str(_veh)},
+        ]}],
+    )
+
+
+def _send_confirm_interactive(sender: str, parsed: dict, derived: dict, modified_field: str = None):
+    body = _build_confirm_msg(parsed, derived, modified_field)
+    send_interactive_buttons(
+        sender, body,
+        [
+            {"id": "SI",       "title": "✅ Guardar"},
+            {"id": "1",        "title": "✏️ Corregir"},
+            {"id": "CANCELAR", "title": "❌ Cancelar"},
+        ],
     )
 
 
@@ -1118,16 +1231,12 @@ def _handle_image(sender: str, message: dict):
                     "nombre": chofer_raw,
                     "ts": time.time(),
                 }
-                send_whatsapp_message(sender, (
-                    f"El chofer {chofer_raw} no está registrado.\n"
-                    f"¿Querés agregarlo? Respondé SI para confirmar."
-                ))
+                _send_chofer_confirm_buttons(sender, chofer_raw)
                 return
             elif len(matches) == 1:
                 log.info(f"Chofer '{chofer_raw}' resuelto a '{matches[0]}' para {_mask(sender)}")
                 parsed["chofer"] = matches[0]
             else:
-                lista = "\n".join(f"{i+1} - {m}" for i, m in enumerate(matches))
                 log.warning(f"Chofer ambiguo '{chofer_raw}' — {len(matches)} matches para {_mask(sender)}")
                 PENDING_CHOFER[sender] = {
                     "parsed": parsed,
@@ -1135,10 +1244,7 @@ def _handle_image(sender: str, message: dict):
                     "matches": matches,
                     "ts": time.time(),
                 }
-                send_whatsapp_message(sender, (
-                    f"Encontré varios choferes con ese nombre:\n{lista}\n\n"
-                    f"¿A cuál pertenece esta recaudación? Respondé con el número."
-                ))
+                _send_chofer_disambiguation_list(sender, matches)
                 return
 
         derived = _derive_fields(fecha_str, parsed)
@@ -1151,11 +1257,7 @@ def _handle_image(sender: str, message: dict):
         total = parsed.get("total_recaudado") or 0
         fecha = parsed.get("fecha") or "?"
         log.info(f"Imagen procesada para {_mask(sender)}: ${total:.0f} del {fecha} — esperando vehículo")
-        send_whatsapp_message(sender, (
-            f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
-            f"¿A qué vehículo pertenece?\n"
-            f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
-        ))
+        _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
 
     except Exception as e:
         log.error(f"Error procesando imagen de {_mask(sender)}: {e}\n{traceback.format_exc()}")
@@ -1191,7 +1293,7 @@ def _handle_text(sender: str, message: dict):
             derived = _derive_fields(parsed.get("fecha", ""), parsed)
             PENDING_CONFIRM[sender] = {"parsed": parsed, "derived": derived, "ts": time.time(), "substate": "confirm"}
             log.info(f"Campo '{campo_db}' corregido para {_mask(sender)}: {text.strip()}")
-            send_whatsapp_message(sender, _build_confirm_msg(parsed, derived, modified_field=campo_db))
+            _send_confirm_interactive(sender, parsed, derived, modified_field=campo_db)
             return
 
         # ── substate: waiting for field selection ─────────────────────
@@ -1211,22 +1313,15 @@ def _handle_text(sender: str, message: dict):
                 }
                 send_whatsapp_message(sender, f"¿Cuál es el {label.lower()} correcto?")
             else:
-                _fecha = parsed.get("fecha") or "?"
-                _total = parsed.get("total_recaudado") or 0
-                _ef    = parsed.get("efectivo_empresa") or 0
-                _chof  = parsed.get("chofer") or "sin nombre"
-                _veh   = parsed.get("vehiculo") or "sin asignar"
-                send_whatsapp_message(sender, (
-                    f"¿Qué campo querés corregir?\n"
-                    f"1 Fecha ({_fecha})\n"
-                    f"2 Total (${_total:.0f})\n"
-                    f"3 Efectivo empresa (${_ef:.0f})\n"
-                    f"4 Chofer ({_chof})\n"
-                    f"5 Vehículo ({_veh})"
-                ))
+                _send_field_select_interactive(sender, parsed)
             return
 
         # ── substate: confirm (default) ────────────────────────────────
+        if text.upper().strip() == "CANCELAR":
+            PENDING_CONFIRM.pop(sender)
+            log.info(f"Confirmación cancelada por {_mask(sender)}")
+            send_whatsapp_message(sender, "Recaudación cancelada. Si querés registrarla, reenviá la foto.")
+            return
         if text.upper().strip() in RESPUESTAS_AFIRMATIVAS:
             PENDING_CONFIRM.pop(sender)
             existing = _find_existing(parsed.get("fecha"), parsed.get("chofer"))
@@ -1263,26 +1358,14 @@ def _handle_text(sender: str, message: dict):
         except ValueError:
             is_number = False
         if is_number:
-            _fecha = parsed.get("fecha") or "?"
-            _total = parsed.get("total_recaudado") or 0
-            _ef    = parsed.get("efectivo_empresa") or 0
-            _chof  = parsed.get("chofer") or "sin nombre"
-            _veh   = parsed.get("vehiculo") or "sin asignar"
             PENDING_CONFIRM[sender] = {
                 "parsed": parsed, "derived": derived,
                 "ts": time.time(), "substate": "field_select",
             }
-            send_whatsapp_message(sender, (
-                f"¿Qué campo querés corregir?\n"
-                f"1 Fecha ({_fecha})\n"
-                f"2 Total (${_total:.0f})\n"
-                f"3 Efectivo empresa (${_ef:.0f})\n"
-                f"4 Chofer ({_chof})\n"
-                f"5 Vehículo ({_veh})"
-            ))
+            _send_field_select_interactive(sender, parsed)
             return
         # Unrecognized response — re-show summary
-        send_whatsapp_message(sender, _build_confirm_msg(parsed, derived))
+        _send_confirm_interactive(sender, parsed, derived)
         return
 
     # Handle pending vehicle selection
@@ -1295,10 +1378,7 @@ def _handle_text(sender: str, message: dict):
             return
         vehiculo = VEHICULOS.get(text.strip().lower())
         if vehiculo is None:
-            send_whatsapp_message(sender, (
-                "No reconocí el vehículo. Respondé con el número o nombre:\n"
-                "1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
-            ))
+            _send_vehicle_list(sender, "No reconocí el vehículo. ¿A cuál pertenece esta recaudación?")
             return
         PENDING_VEHICLE.pop(sender)
         parsed  = pending["parsed"]
@@ -1306,7 +1386,7 @@ def _handle_text(sender: str, message: dict):
         parsed["vehiculo"] = vehiculo
         PENDING_CONFIRM[sender] = {"parsed": parsed, "derived": derived, "ts": time.time(), "substate": "confirm"}
         log.info(f"Vehículo '{vehiculo}' seleccionado para {_mask(sender)} — esperando confirmación")
-        send_whatsapp_message(sender, _build_confirm_msg(parsed, derived))
+        _send_confirm_interactive(sender, parsed, derived)
         return
 
     # Handle pending chofer name input (image couldn't read it)
@@ -1330,10 +1410,7 @@ def _handle_text(sender: str, message: dict):
                 "nombre": nombre,
                 "ts": time.time(),
             }
-            send_whatsapp_message(sender, (
-                f"El chofer {nombre} no está registrado.\n"
-                f"¿Querés agregarlo? Respondé SI para confirmar."
-            ))
+            _send_chofer_confirm_buttons(sender, nombre)
         elif len(matches) == 1:
             parsed["chofer"] = matches[0]
             log.info(f"Chofer ingresado resuelto a '{matches[0]}' para {_mask(sender)}")
@@ -1341,13 +1418,8 @@ def _handle_text(sender: str, message: dict):
             PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
             total = parsed.get("total_recaudado") or 0
             fecha = parsed.get("fecha") or "?"
-            send_whatsapp_message(sender, (
-                f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
-                f"¿A qué vehículo pertenece?\n"
-                f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
-            ))
+            _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
         else:
-            lista = "\n".join(f"{i+1} - {m}" for i, m in enumerate(matches))
             log.warning(f"Chofer ambiguo '{text.strip()}' — {len(matches)} matches para {_mask(sender)}")
             PENDING_CHOFER[sender] = {
                 "parsed": parsed,
@@ -1355,10 +1427,7 @@ def _handle_text(sender: str, message: dict):
                 "matches": matches,
                 "ts": time.time(),
             }
-            send_whatsapp_message(sender, (
-                f"Encontré varios choferes con ese nombre:\n{lista}\n\n"
-                f"¿A cuál pertenece esta recaudación? Respondé con el número."
-            ))
+            _send_chofer_disambiguation_list(sender, matches)
         return
 
     # Handle pending new chofer confirmation (SI to add / NO to cancel)
@@ -1394,22 +1463,15 @@ def _handle_text(sender: str, message: dict):
             PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
             total = parsed.get("total_recaudado") or 0
             fecha = parsed.get("fecha") or "?"
-            send_whatsapp_message(sender, (
-                f"Chofer {nombre} agregado correctamente.\n\n"
-                f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
-                f"¿A qué vehículo pertenece?\n"
-                f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
-            ))
+            send_whatsapp_message(sender, f"Chofer {nombre} agregado correctamente.")
+            _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
         elif respuesta in {"NO", "N", "CANCELAR"}:
             PENDING_CHOFER_CONFIRM.pop(sender)
             nombre = pending["nombre"]
             log.info(f"Alta de chofer '{nombre}' cancelada por {_mask(sender)}")
             send_whatsapp_message(sender, "Entendido. Si querés registrar la recaudación, reenviá la foto.")
         else:
-            send_whatsapp_message(sender, (
-                f"¿Confirmás agregar a {pending['nombre']} como chofer?\n"
-                f"Respondé SI para confirmar o NO para cancelar."
-            ))
+            _send_chofer_confirm_buttons(sender, pending["nombre"])
         return
 
     # Handle pending chofer disambiguation
@@ -1421,13 +1483,12 @@ def _handle_text(sender: str, message: dict):
             send_whatsapp_message(sender, "La selección de chofer expiró. Mandá la imagen nuevamente.")
             return
         matches = pending["matches"]
-        lista   = "\n".join(f"{i+1} - {m}" for i, m in enumerate(matches))
         try:
             idx = int(text.strip()) - 1
             if not (0 <= idx < len(matches)):
                 raise ValueError
         except ValueError:
-            send_whatsapp_message(sender, f"Respondé con el número del chofer:\n{lista}")
+            _send_chofer_disambiguation_list(sender, matches)
             return
         PENDING_CHOFER.pop(sender)
         parsed            = pending["parsed"]
@@ -1437,11 +1498,7 @@ def _handle_text(sender: str, message: dict):
         PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
         total = parsed.get("total_recaudado") or 0
         fecha = parsed.get("fecha") or "?"
-        send_whatsapp_message(sender, (
-            f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
-            f"¿A qué vehículo pertenece?\n"
-            f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
-        ))
+        _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
         return
 
     # Handle pending empresa RUT flow
@@ -1558,6 +1615,18 @@ async def receive_message(request: Request):
             _handle_image(sender, message)
         elif msg_type == "text":
             _handle_text(sender, message)
+        elif msg_type == "interactive":
+            interactive = message.get("interactive", {})
+            itype       = interactive.get("type")
+            if itype == "button_reply":
+                reply_id = interactive["button_reply"]["id"]
+            elif itype == "list_reply":
+                reply_id = interactive["list_reply"]["id"]
+            else:
+                reply_id = None
+            if reply_id is not None:
+                log.info(f"Respuesta interactiva de {_mask(sender)}: {reply_id!r}")
+                _handle_text(sender, {"text": {"body": reply_id}})
         else:
             log.info(f"Tipo de mensaje no soportado ignorado: {msg_type}")
 
