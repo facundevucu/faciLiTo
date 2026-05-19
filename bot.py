@@ -60,6 +60,10 @@ PENDING_VEHICLE: dict = {}
 PENDING_CHOFER: dict = {}
 # sender → {parsed, fecha_str, ts}  (waiting for user to provide unreadable chofer name)
 PENDING_CHOFER_NAME: dict = {}
+# sender → {parsed, fecha_str, nombre, ts}  (waiting for SI/NO to register a new chofer)
+PENDING_CHOFER_CONFIRM: dict = {}
+# sender → {parsed, derived, ts}  (waiting for pre-save confirmation / field corrections)
+PENDING_CONFIRM: dict = {}
 
 BOT_TOOLS = [
     {
@@ -200,6 +204,7 @@ def _build_image_prompt() -> str:
         json_fields[_empresa_to_key(e)] = 0.0
     json_fields["otros_combustible"] = 0.0
     json_fields["efectivo_empresa"]  = 0.0
+    json_fields["monto_dudoso"]      = False
 
     json_str = json.dumps(json_fields, ensure_ascii=False, indent=2)
     return (
@@ -215,8 +220,22 @@ def _build_image_prompt() -> str:
         "IMPORTANTE sobre los montos: en Uruguay el punto es separador de miles y la coma es decimal.\n"
         'Ejemplos de conversión: "6.000" = 6000, "1.500" = 1500, "12.350,50" = 12350.5, "500" = 500.\n'
         "Convertí todos los montos a números sin separadores de miles.\n\n"
+        "IMPORTANTE sobre números manuscritos:\n"
+        "- El dígito 3 escrito a mano frecuentemente parece un 7. "
+        "Para validar el total recaudado, sumá los componentes: "
+        "efectivo_empresa + comision_30 + total_pos + total_fiado + (empresa_pul + empresa_lumin_civil "
+        "+ empresa_lumin_energia + empresa_mides + empresa_hospital) + otros_combustible. "
+        "Si la suma se aproxima a uno de los dos valores posibles, usá ese. "
+        "Si no podés validar, devolvé el número que veas pero marcá monto_dudoso: true en el JSON.\n"
+        "- El año: '26' siempre es 2026, '25' siempre es 2025.\n\n"
         "IMPORTANTE: el campo 'efectivo_empresa' debe leerse directamente del campo 'EFECTIVO EMPRESA' "
         "de la imagen. No lo calcules ni lo deduzcas — copiá el valor tal como aparece en la planilla.\n\n"
+        "IMPORTANTE — últimas dos filas de la tabla: las últimas dos filas son siempre:\n"
+        "- EFECTIVO EMPRESA: contiene un número (ej: 1359, 905, 4750)\n"
+        "- CHOFER: contiene un nombre de persona (ej: Ale, Facundo, Cristian)\n"
+        "Nunca confundas estos dos campos. EFECTIVO EMPRESA siempre es un número. "
+        "CHOFER siempre es un nombre. Si ves un número en las últimas filas y un nombre debajo, "
+        "el número es efectivo_empresa y el nombre es chofer.\n\n"
         "IMPORTANTE: si el nombre del chofer no es legible con certeza, devolvé chofer: null en lugar "
         "de intentar adivinar. No devuelvas el texto de la etiqueta ('CHOFER') como valor.\n\n"
         "Respondé SOLO con un JSON con esta estructura exacta (usá null para campos vacíos o ilegibles):\n"
@@ -1003,6 +1022,34 @@ def _do_update(record_id: int, parsed: dict, derived: dict):
     conn.close()
 
 
+def _build_confirm_msg(parsed: dict, derived: dict, modified_field: str = None) -> str:
+    fecha    = parsed.get("fecha") or "?"
+    chofer   = parsed.get("chofer") or "sin nombre"
+    vehiculo = parsed.get("vehiculo") or "sin asignar"
+    total    = parsed.get("total_recaudado") or 0
+    ef_emp   = parsed.get("efectivo_empresa") or 0
+    pos      = parsed.get("total_pos") or 0
+    dudoso   = parsed.get("monto_dudoso")
+
+    def _e(campo):
+        return "✏️ " if modified_field == campo else ""
+
+    total_suffix = " (no estoy seguro, verificá este número)" if dudoso else ""
+    total_icon   = "⚠️" if dudoso else "💰"
+    return (
+        f"📋 Resumen de la recaudación:\n"
+        f"📅 {_e('fecha')}Fecha: {fecha}\n"
+        f"👤 {_e('chofer')}Chofer: {chofer}\n"
+        f"🚗 {_e('vehiculo')}Vehículo: {vehiculo}\n"
+        f"{total_icon} {_e('total_recaudado')}Total: ${total:.0f}{total_suffix}\n"
+        f"🏦 {_e('efectivo_empresa')}Efectivo empresa: ${ef_emp:.0f}\n"
+        f"💳 POS: ${pos:.0f}\n\n"
+        f"¿Todo correcto? Respondé:\n"
+        f"✅ SI para guardar\n"
+        f"🔢 Cualquier número si algo está mal"
+    )
+
+
 def _confirmation_msg(parsed: dict, derived: dict, verb: str) -> str:
     chofer     = parsed.get("chofer") or "sin nombre"
     fecha      = parsed.get("fecha") or "?"
@@ -1065,9 +1112,15 @@ def _handle_image(sender: str, message: dict):
             matches = _match_choferes(chofer_raw)
             if len(matches) == 0:
                 log.warning(f"Chofer no registrado '{chofer_raw}' para {_mask(sender)}")
+                PENDING_CHOFER_CONFIRM[sender] = {
+                    "parsed": parsed,
+                    "fecha_str": fecha_str,
+                    "nombre": chofer_raw,
+                    "ts": time.time(),
+                }
                 send_whatsapp_message(sender, (
                     f"El chofer {chofer_raw} no está registrado.\n"
-                    f"Si es nuevo respondé CHOFER NUEVO {chofer_raw} para agregarlo."
+                    f"¿Querés agregarlo? Respondé SI para confirmar."
                 ))
                 return
             elif len(matches) == 1:
@@ -1112,7 +1165,127 @@ def _handle_image(sender: str, message: dict):
 def _handle_text(sender: str, message: dict):
     text = message["text"]["body"].strip()
 
-    # Handle pending vehicle selection — MUST be first
+    # Handle pre-save confirmation / field corrections — MUST be first
+    if sender in PENDING_CONFIRM:
+        pending  = PENDING_CONFIRM[sender]
+        if time.time() - pending["ts"] > VEHICLE_TIMEOUT:
+            PENDING_CONFIRM.pop(sender)
+            log.info(f"Confirmación de guardado expirada para {_mask(sender)}")
+            send_whatsapp_message(sender, "La confirmación expiró. Mandá la imagen nuevamente.")
+            return
+        parsed   = pending["parsed"]
+        derived  = pending["derived"]
+        substate = pending.get("substate", "confirm")
+
+        # ── substate: waiting for corrected value ─────────────────────
+        if substate == "value_input":
+            campo_db = pending["campo_db"]
+            if campo_db in ("fecha", "chofer", "vehiculo"):
+                parsed[campo_db] = text.strip()
+            else:
+                try:
+                    parsed[campo_db] = float(text.strip().replace(",", "."))
+                except ValueError:
+                    send_whatsapp_message(sender, f"Valor inválido: '{text.strip()}'. Ingresá un número.")
+                    return
+            derived = _derive_fields(parsed.get("fecha", ""), parsed)
+            PENDING_CONFIRM[sender] = {"parsed": parsed, "derived": derived, "ts": time.time(), "substate": "confirm"}
+            log.info(f"Campo '{campo_db}' corregido para {_mask(sender)}: {text.strip()}")
+            send_whatsapp_message(sender, _build_confirm_msg(parsed, derived, modified_field=campo_db))
+            return
+
+        # ── substate: waiting for field selection ─────────────────────
+        if substate == "field_select":
+            _MENU = {
+                "1": ("fecha",            "Fecha"),
+                "2": ("total_recaudado",  "Total"),
+                "3": ("efectivo_empresa", "Efectivo empresa"),
+                "4": ("chofer",           "Chofer"),
+                "5": ("vehiculo",         "Vehículo"),
+            }
+            if text.strip() in _MENU:
+                campo_db, label = _MENU[text.strip()]
+                PENDING_CONFIRM[sender] = {
+                    "parsed": parsed, "derived": derived,
+                    "ts": time.time(), "substate": "value_input", "campo_db": campo_db,
+                }
+                send_whatsapp_message(sender, f"¿Cuál es el {label.lower()} correcto?")
+            else:
+                _fecha = parsed.get("fecha") or "?"
+                _total = parsed.get("total_recaudado") or 0
+                _ef    = parsed.get("efectivo_empresa") or 0
+                _chof  = parsed.get("chofer") or "sin nombre"
+                _veh   = parsed.get("vehiculo") or "sin asignar"
+                send_whatsapp_message(sender, (
+                    f"¿Qué campo querés corregir?\n"
+                    f"1 Fecha ({_fecha})\n"
+                    f"2 Total (${_total:.0f})\n"
+                    f"3 Efectivo empresa (${_ef:.0f})\n"
+                    f"4 Chofer ({_chof})\n"
+                    f"5 Vehículo ({_veh})"
+                ))
+            return
+
+        # ── substate: confirm (default) ────────────────────────────────
+        if text.upper().strip() in RESPUESTAS_AFIRMATIVAS:
+            PENDING_CONFIRM.pop(sender)
+            existing = _find_existing(parsed.get("fecha"), parsed.get("chofer"))
+            if existing:
+                PENDING_REPLACEMENTS[sender] = {
+                    "parsed": parsed, "derived": derived,
+                    "existing_id": existing["id"], "existing_total": existing["total"],
+                }
+                chofer = parsed.get("chofer") or "sin nombre"
+                fecha  = parsed.get("fecha") or "?"
+                log.warning(f"Duplicado detectado para {_mask(sender)}: {chofer} {fecha}")
+                send_whatsapp_message(sender, (
+                    f"Ya existe un registro para {chofer} del {fecha} "
+                    f"con un total de ${existing['total']:.0f}.\n"
+                    f"¿Querés reemplazarlo? Respondé SI para confirmar."
+                ))
+                return
+            try:
+                _do_insert(parsed, derived)
+                log.info(
+                    f"Recaudación guardada para {_mask(sender)}: "
+                    f"chofer={parsed.get('chofer')} vehiculo={parsed.get('vehiculo')} "
+                    f"total=${parsed.get('total_recaudado')}"
+                )
+            except sqlite3.Error as db_err:
+                log.error(f"Error al guardar en DB: {db_err}")
+                send_whatsapp_message(sender, "Leí los datos pero hubo un error al guardarlos. Avisale al administrador.")
+                return
+            send_whatsapp_message(sender, _confirmation_msg(parsed, derived, "✅ Guardado!"))
+            return
+        try:
+            float(text.strip().replace(",", "."))
+            is_number = True
+        except ValueError:
+            is_number = False
+        if is_number:
+            _fecha = parsed.get("fecha") or "?"
+            _total = parsed.get("total_recaudado") or 0
+            _ef    = parsed.get("efectivo_empresa") or 0
+            _chof  = parsed.get("chofer") or "sin nombre"
+            _veh   = parsed.get("vehiculo") or "sin asignar"
+            PENDING_CONFIRM[sender] = {
+                "parsed": parsed, "derived": derived,
+                "ts": time.time(), "substate": "field_select",
+            }
+            send_whatsapp_message(sender, (
+                f"¿Qué campo querés corregir?\n"
+                f"1 Fecha ({_fecha})\n"
+                f"2 Total (${_total:.0f})\n"
+                f"3 Efectivo empresa (${_ef:.0f})\n"
+                f"4 Chofer ({_chof})\n"
+                f"5 Vehículo ({_veh})"
+            ))
+            return
+        # Unrecognized response — re-show summary
+        send_whatsapp_message(sender, _build_confirm_msg(parsed, derived))
+        return
+
+    # Handle pending vehicle selection
     if sender in PENDING_VEHICLE:
         pending = PENDING_VEHICLE[sender]
         if time.time() - pending["ts"] > VEHICLE_TIMEOUT:
@@ -1131,34 +1304,9 @@ def _handle_text(sender: str, message: dict):
         parsed  = pending["parsed"]
         derived = pending["derived"]
         parsed["vehiculo"] = vehiculo
-        existing = _find_existing(parsed.get("fecha"), parsed.get("chofer"))
-        if existing:
-            PENDING_REPLACEMENTS[sender] = {
-                "parsed": parsed,
-                "derived": derived,
-                "existing_id": existing["id"],
-                "existing_total": existing["total"],
-            }
-            chofer = parsed.get("chofer") or "sin nombre"
-            fecha  = parsed.get("fecha") or "?"
-            log.warning(f"Duplicado detectado para {_mask(sender)}: {chofer} {fecha}")
-            send_whatsapp_message(sender, (
-                f"Ya existe un registro para {chofer} del {fecha} "
-                f"con un total de ${existing['total']:.0f}.\n"
-                f"¿Querés reemplazarlo? Respondé SI para confirmar."
-            ))
-            return
-        try:
-            _do_insert(parsed, derived)
-            log.info(
-                f"Recaudación guardada para {_mask(sender)}: "
-                f"chofer={parsed.get('chofer')} vehiculo={vehiculo} total=${parsed.get('total_recaudado')}"
-            )
-        except sqlite3.Error as db_err:
-            log.error(f"Error al guardar en DB: {db_err}")
-            send_whatsapp_message(sender, "Leí los datos pero hubo un error al guardarlos. Avisale al administrador.")
-            return
-        send_whatsapp_message(sender, _confirmation_msg(parsed, derived, "Guardado!"))
+        PENDING_CONFIRM[sender] = {"parsed": parsed, "derived": derived, "ts": time.time(), "substate": "confirm"}
+        log.info(f"Vehículo '{vehiculo}' seleccionado para {_mask(sender)} — esperando confirmación")
+        send_whatsapp_message(sender, _build_confirm_msg(parsed, derived))
         return
 
     # Handle pending chofer name input (image couldn't read it)
@@ -1174,10 +1322,17 @@ def _handle_text(sender: str, message: dict):
         fecha_str = pending["fecha_str"]
         matches   = _match_choferes(text.strip())
         if len(matches) == 0:
-            log.warning(f"Chofer ingresado '{text.strip()}' no registrado para {_mask(sender)}")
+            nombre = text.strip()
+            log.warning(f"Chofer ingresado '{nombre}' no registrado para {_mask(sender)}")
+            PENDING_CHOFER_CONFIRM[sender] = {
+                "parsed": parsed,
+                "fecha_str": fecha_str,
+                "nombre": nombre,
+                "ts": time.time(),
+            }
             send_whatsapp_message(sender, (
-                f"El chofer {text.strip()} no está registrado.\n"
-                f"Si es nuevo respondé CHOFER NUEVO {text.strip()} para agregarlo."
+                f"El chofer {nombre} no está registrado.\n"
+                f"¿Querés agregarlo? Respondé SI para confirmar."
             ))
         elif len(matches) == 1:
             parsed["chofer"] = matches[0]
@@ -1203,6 +1358,57 @@ def _handle_text(sender: str, message: dict):
             send_whatsapp_message(sender, (
                 f"Encontré varios choferes con ese nombre:\n{lista}\n\n"
                 f"¿A cuál pertenece esta recaudación? Respondé con el número."
+            ))
+        return
+
+    # Handle pending new chofer confirmation (SI to add / NO to cancel)
+    if sender in PENDING_CHOFER_CONFIRM:
+        pending = PENDING_CHOFER_CONFIRM[sender]
+        if time.time() - pending["ts"] > CHOFER_TIMEOUT:
+            PENDING_CHOFER_CONFIRM.pop(sender)
+            log.info(f"Confirmación de chofer expirada para {_mask(sender)}")
+            send_whatsapp_message(sender, "La confirmación expiró. Mandá la imagen nuevamente.")
+            return
+        respuesta = text.upper().strip()
+        if respuesta in RESPUESTAS_AFIRMATIVAS:
+            PENDING_CHOFER_CONFIRM.pop(sender)
+            nombre    = pending["nombre"]
+            parsed    = pending["parsed"]
+            fecha_str = pending["fecha_str"]
+            try:
+                conn = sqlite3.connect(DB_PATH)
+                c = conn.cursor()
+                c.execute(
+                    "INSERT INTO choferes (nombre, activo, creado_en) VALUES (?,1,?)",
+                    (nombre, datetime.now().isoformat())
+                )
+                conn.commit()
+                conn.close()
+                log.info(f"Chofer nuevo agregado desde confirmación: {nombre}")
+            except sqlite3.Error as e:
+                log.error(f"Error agregando chofer '{nombre}': {e}")
+                send_whatsapp_message(sender, "Hubo un error al agregar el chofer. Intentá de nuevo.")
+                return
+            parsed["chofer"] = nombre
+            derived = _derive_fields(fecha_str, parsed)
+            PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
+            total = parsed.get("total_recaudado") or 0
+            fecha = parsed.get("fecha") or "?"
+            send_whatsapp_message(sender, (
+                f"Chofer {nombre} agregado correctamente.\n\n"
+                f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
+                f"¿A qué vehículo pertenece?\n"
+                f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
+            ))
+        elif respuesta in {"NO", "N", "CANCELAR"}:
+            PENDING_CHOFER_CONFIRM.pop(sender)
+            nombre = pending["nombre"]
+            log.info(f"Alta de chofer '{nombre}' cancelada por {_mask(sender)}")
+            send_whatsapp_message(sender, "Entendido. Si querés registrar la recaudación, reenviá la foto.")
+        else:
+            send_whatsapp_message(sender, (
+                f"¿Confirmás agregar a {pending['nombre']} como chofer?\n"
+                f"Respondé SI para confirmar o NO para cancelar."
             ))
         return
 
