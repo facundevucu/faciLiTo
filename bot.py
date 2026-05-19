@@ -1085,18 +1085,17 @@ def _build_confirm_msg(parsed: dict, derived: dict, modified_field: str = None) 
     dudoso   = parsed.get("monto_dudoso")
 
     def _e(campo):
-        return "✏️ " if modified_field == campo else ""
+        return "→ " if modified_field == campo else ""
 
-    total_suffix = " (no estoy seguro, verificá este número)" if dudoso else ""
-    total_icon   = "⚠️" if dudoso else "💰"
+    total_suffix = " *(verificar)*" if dudoso else ""
     return (
-        f"📋 Resumen de la recaudación:\n"
-        f"📅 {_e('fecha')}Fecha: {fecha}\n"
-        f"👤 {_e('chofer')}Chofer: {chofer}\n"
-        f"🚗 {_e('vehiculo')}Vehículo: {vehiculo}\n"
-        f"{total_icon} {_e('total_recaudado')}Total: ${total:.0f}{total_suffix}\n"
-        f"🏦 {_e('efectivo_empresa')}Efectivo empresa: ${ef_emp:.0f}\n"
-        f"💳 POS: ${pos:.0f}\n\n"
+        f"*Resumen de la recaudación*\n"
+        f"*Fecha:* {_e('fecha')}{fecha}\n"
+        f"*Chofer:* {_e('chofer')}{chofer}\n"
+        f"*Vehículo:* {_e('vehiculo')}{vehiculo}\n"
+        f"*Total:* {_e('total_recaudado')}${total:.0f}{total_suffix}\n"
+        f"*Efectivo empresa:* {_e('efectivo_empresa')}${ef_emp:.0f}\n"
+        f"*POS:* ${pos:.0f}\n\n"
         f"¿Todo correcto? Respondé *SI* para guardar, un número para corregir o *CANCELAR*."
     )
 
@@ -1136,7 +1135,7 @@ def _send_chofer_confirm_buttons(sender: str, nombre: str):
     send_interactive_buttons(
         sender,
         f"El chofer *{nombre}* no está registrado. ¿Querés agregarlo al sistema?",
-        [{"id": "SI", "title": "✅ Sí, agregar"}, {"id": "NO", "title": "❌ No"}],
+        [{"id": "SI", "title": "Si, agregar"}, {"id": "NO", "title": "No"}],
     )
 
 
@@ -1185,9 +1184,9 @@ def _send_confirm_interactive(sender: str, parsed: dict, derived: dict, modified
     send_interactive_buttons(
         sender, body,
         [
-            {"id": "SI",       "title": "✅ Guardar"},
-            {"id": "1",        "title": "✏️ Corregir"},
-            {"id": "CANCELAR", "title": "❌ Cancelar"},
+            {"id": "SI",       "title": "Guardar"},
+            {"id": "1",        "title": "Corregir"},
+            {"id": "CANCELAR", "title": "Cancelar"},
         ],
     )
 
@@ -1207,7 +1206,7 @@ def _resolve_chofer_and_continue(sender: str, parsed: dict, fecha_str: str, nomb
         PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
         total = parsed.get("total_recaudado") or 0
         fecha = parsed.get("fecha") or "?"
-        _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
+        _send_vehicle_list(sender, f"*Recaudación detectada:* ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
     else:
         log.warning(f"Chofer ambiguo '{nombre}' — {len(matches)} matches para {_mask(sender)}")
         PENDING_CHOFER[sender] = {
@@ -1263,7 +1262,7 @@ def _handle_image(sender: str, message: dict):
             send_interactive_buttons(
                 sender,
                 f"Leí el nombre del chofer como: *{chofer_raw}*\n¿Es correcto?",
-                [{"id": "SI", "title": "✅ Sí"}, {"id": "NO", "title": "✏️ No, corregir"}],
+                [{"id": "SI", "title": "Si"}, {"id": "NO", "title": "No, corregir"}],
             )
             return
 
@@ -1363,7 +1362,7 @@ def _handle_text(sender: str, message: dict):
                 log.error(f"Error al guardar en DB: {db_err}")
                 send_whatsapp_message(sender, "Leí los datos pero hubo un error al guardarlos. Avisale al administrador.")
                 return
-            send_whatsapp_message(sender, _confirmation_msg(parsed, derived, "✅ Guardado!"))
+            send_whatsapp_message(sender, _confirmation_msg(parsed, derived, "*Guardado*"))
             return
         try:
             float(text.strip().replace(",", "."))
@@ -1444,7 +1443,7 @@ def _handle_text(sender: str, message: dict):
             send_interactive_buttons(
                 sender,
                 f"Leí el nombre del chofer como: *{nombre}*\n¿Es correcto?",
-                [{"id": "SI", "title": "✅ Sí"}, {"id": "NO", "title": "✏️ No, corregir"}],
+                [{"id": "SI", "title": "Si"}, {"id": "NO", "title": "No, corregir"}],
             )
         return
 
@@ -1482,7 +1481,7 @@ def _handle_text(sender: str, message: dict):
             total = parsed.get("total_recaudado") or 0
             fecha = parsed.get("fecha") or "?"
             send_whatsapp_message(sender, f"Chofer {nombre} agregado correctamente.")
-            _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
+            _send_vehicle_list(sender, f"*Recaudación detectada:* ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
         elif respuesta in {"NO", "N", "CANCELAR"}:
             PENDING_CHOFER_CONFIRM.pop(sender)
             nombre = pending["nombre"]
@@ -1516,7 +1515,7 @@ def _handle_text(sender: str, message: dict):
         PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
         total = parsed.get("total_recaudado") or 0
         fecha = parsed.get("fecha") or "?"
-        _send_vehicle_list(sender, f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
+        _send_vehicle_list(sender, f"*Recaudación detectada:* ${total:.0f} del {fecha}.\n¿A qué vehículo pertenece?")
         return
 
     # Handle pending empresa RUT flow
