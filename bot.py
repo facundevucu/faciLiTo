@@ -58,6 +58,8 @@ PENDING_EMPRESA: dict = {}
 PENDING_VEHICLE: dict = {}
 # sender → {parsed, fecha_str, matches, ts}  (waiting for chofer disambiguation)
 PENDING_CHOFER: dict = {}
+# sender → {parsed, fecha_str, ts}  (waiting for user to provide unreadable chofer name)
+PENDING_CHOFER_NAME: dict = {}
 
 BOT_TOOLS = [
     {
@@ -203,11 +205,20 @@ def _build_image_prompt() -> str:
     return (
         "Sos un asistente financiero. Analizá esta imagen de un formulario de recaudación "
         "y extraé todos los campos visibles.\n\n"
+        "ESTRUCTURA DE LA PLANILLA: tiene una tabla con dos columnas — etiquetas a la izquierda "
+        "y valores a la derecha dentro de celdas delimitadas. "
+        "Extraé ÚNICAMENTE los valores que están dentro de las celdas de la tabla. "
+        "Ignorá completamente cualquier texto, número o anotación que esté fuera de la tabla "
+        "(notas al margen, cálculos debajo, texto en el borde del papel, etc.). "
+        "En esta planilla el único texto fuera de la tabla que puede aparecer son cálculos manuales "
+        "como 'Empresa - 1359 / Botella Gomería - 200 / Total - 1159'. Ignoralos.\n\n"
         "IMPORTANTE sobre los montos: en Uruguay el punto es separador de miles y la coma es decimal.\n"
         'Ejemplos de conversión: "6.000" = 6000, "1.500" = 1500, "12.350,50" = 12350.5, "500" = 500.\n'
         "Convertí todos los montos a números sin separadores de miles.\n\n"
         "IMPORTANTE: el campo 'efectivo_empresa' debe leerse directamente del campo 'EFECTIVO EMPRESA' "
         "de la imagen. No lo calcules ni lo deduzcas — copiá el valor tal como aparece en la planilla.\n\n"
+        "IMPORTANTE: si el nombre del chofer no es legible con certeza, devolvé chofer: null en lugar "
+        "de intentar adivinar. No devuelvas el texto de la etiqueta ('CHOFER') como valor.\n\n"
         "Respondé SOLO con un JSON con esta estructura exacta (usá null para campos vacíos o ilegibles):\n"
         f"{json_str}\n\n"
         "Si la imagen no es un formulario de recaudación o no podés extraer datos básicos respondé:\n"
@@ -665,6 +676,20 @@ def _normalize(s: str) -> str:
     return "".join(c for c in s if unicodedata.category(c) != "Mn")
 
 
+def _chofer_es_ilegible(valor: str | None) -> bool:
+    """True when the value extracted from the image is clearly not a real chofer name."""
+    if not valor:
+        return True
+    norm = _normalize(valor.strip())
+    if not norm:
+        return True
+    _EXACTOS   = {"CHOFER", "ILEGIBLE", "NO SE", "?", "N/A", "S/D", "NULL", "NONE"}
+    _PALABRAS  = {"CHOFER", "ILEGIBLE"}
+    if norm in {_normalize(w) for w in _EXACTOS}:
+        return True
+    return bool(set(norm.split()) & {_normalize(w) for w in _PALABRAS})
+
+
 def _match_choferes(nombre: str) -> list:
     """Returns active chofer names that share at least one word with `nombre`."""
     if not nombre:
@@ -1015,6 +1040,7 @@ def _handle_image(sender: str, message: dict):
         if not match:
             raise ValueError("Claude no devolvió JSON válido")
         parsed = json.loads(match.group())
+        log.info(f"[DEBUG] JSON extraído: {json.dumps(parsed, ensure_ascii=False)}")
 
         if "error" in parsed:
             log.warning(f"Claude no pudo extraer datos de imagen de {_mask(sender)}")
@@ -1023,6 +1049,18 @@ def _handle_image(sender: str, message: dict):
 
         fecha_str  = parsed.get("fecha", "")
         chofer_raw = parsed.get("chofer")
+        if _chofer_es_ilegible(chofer_raw):
+            log.warning(f"Chofer ilegible en imagen para {_mask(sender)}: {chofer_raw!r}")
+            PENDING_CHOFER_NAME[sender] = {
+                "parsed": parsed,
+                "fecha_str": fecha_str,
+                "ts": time.time(),
+            }
+            send_whatsapp_message(sender, (
+                "No pude leer el nombre del chofer en la imagen.\n"
+                "¿Quién es el chofer de esta recaudación?"
+            ))
+            return
         if chofer_raw:
             matches = _match_choferes(chofer_raw)
             if len(matches) == 0:
@@ -1074,39 +1112,7 @@ def _handle_image(sender: str, message: dict):
 def _handle_text(sender: str, message: dict):
     text = message["text"]["body"].strip()
 
-    # Handle pending chofer disambiguation
-    if sender in PENDING_CHOFER:
-        pending = PENDING_CHOFER[sender]
-        if time.time() - pending["ts"] > CHOFER_TIMEOUT:
-            PENDING_CHOFER.pop(sender)
-            log.info(f"Selección de chofer expirada para {_mask(sender)}")
-            send_whatsapp_message(sender, "La selección de chofer expiró. Mandá la imagen nuevamente.")
-            return
-        matches = pending["matches"]
-        lista   = "\n".join(f"{i+1} - {m}" for i, m in enumerate(matches))
-        try:
-            idx = int(text.strip()) - 1
-            if not (0 <= idx < len(matches)):
-                raise ValueError
-        except ValueError:
-            send_whatsapp_message(sender, f"Respondé con el número del chofer:\n{lista}")
-            return
-        PENDING_CHOFER.pop(sender)
-        parsed            = pending["parsed"]
-        parsed["chofer"]  = matches[idx]
-        log.info(f"Chofer seleccionado '{matches[idx]}' para {_mask(sender)}")
-        derived = _derive_fields(pending["fecha_str"], parsed)
-        PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
-        total = parsed.get("total_recaudado") or 0
-        fecha = parsed.get("fecha") or "?"
-        send_whatsapp_message(sender, (
-            f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
-            f"¿A qué vehículo pertenece?\n"
-            f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
-        ))
-        return
-
-    # Handle pending vehicle selection
+    # Handle pending vehicle selection — MUST be first
     if sender in PENDING_VEHICLE:
         pending = PENDING_VEHICLE[sender]
         if time.time() - pending["ts"] > VEHICLE_TIMEOUT:
@@ -1153,6 +1159,83 @@ def _handle_text(sender: str, message: dict):
             send_whatsapp_message(sender, "Leí los datos pero hubo un error al guardarlos. Avisale al administrador.")
             return
         send_whatsapp_message(sender, _confirmation_msg(parsed, derived, "Guardado!"))
+        return
+
+    # Handle pending chofer name input (image couldn't read it)
+    if sender in PENDING_CHOFER_NAME:
+        pending = PENDING_CHOFER_NAME[sender]
+        if time.time() - pending["ts"] > CHOFER_TIMEOUT:
+            PENDING_CHOFER_NAME.pop(sender)
+            log.info(f"Espera de nombre de chofer expirada para {_mask(sender)}")
+            send_whatsapp_message(sender, "La espera expiró. Mandá la imagen nuevamente.")
+            return
+        PENDING_CHOFER_NAME.pop(sender)
+        parsed    = pending["parsed"]
+        fecha_str = pending["fecha_str"]
+        matches   = _match_choferes(text.strip())
+        if len(matches) == 0:
+            log.warning(f"Chofer ingresado '{text.strip()}' no registrado para {_mask(sender)}")
+            send_whatsapp_message(sender, (
+                f"El chofer {text.strip()} no está registrado.\n"
+                f"Si es nuevo respondé CHOFER NUEVO {text.strip()} para agregarlo."
+            ))
+        elif len(matches) == 1:
+            parsed["chofer"] = matches[0]
+            log.info(f"Chofer ingresado resuelto a '{matches[0]}' para {_mask(sender)}")
+            derived = _derive_fields(fecha_str, parsed)
+            PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
+            total = parsed.get("total_recaudado") or 0
+            fecha = parsed.get("fecha") or "?"
+            send_whatsapp_message(sender, (
+                f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
+                f"¿A qué vehículo pertenece?\n"
+                f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
+            ))
+        else:
+            lista = "\n".join(f"{i+1} - {m}" for i, m in enumerate(matches))
+            log.warning(f"Chofer ambiguo '{text.strip()}' — {len(matches)} matches para {_mask(sender)}")
+            PENDING_CHOFER[sender] = {
+                "parsed": parsed,
+                "fecha_str": fecha_str,
+                "matches": matches,
+                "ts": time.time(),
+            }
+            send_whatsapp_message(sender, (
+                f"Encontré varios choferes con ese nombre:\n{lista}\n\n"
+                f"¿A cuál pertenece esta recaudación? Respondé con el número."
+            ))
+        return
+
+    # Handle pending chofer disambiguation
+    if sender in PENDING_CHOFER:
+        pending = PENDING_CHOFER[sender]
+        if time.time() - pending["ts"] > CHOFER_TIMEOUT:
+            PENDING_CHOFER.pop(sender)
+            log.info(f"Selección de chofer expirada para {_mask(sender)}")
+            send_whatsapp_message(sender, "La selección de chofer expiró. Mandá la imagen nuevamente.")
+            return
+        matches = pending["matches"]
+        lista   = "\n".join(f"{i+1} - {m}" for i, m in enumerate(matches))
+        try:
+            idx = int(text.strip()) - 1
+            if not (0 <= idx < len(matches)):
+                raise ValueError
+        except ValueError:
+            send_whatsapp_message(sender, f"Respondé con el número del chofer:\n{lista}")
+            return
+        PENDING_CHOFER.pop(sender)
+        parsed            = pending["parsed"]
+        parsed["chofer"]  = matches[idx]
+        log.info(f"Chofer seleccionado '{matches[idx]}' para {_mask(sender)}")
+        derived = _derive_fields(pending["fecha_str"], parsed)
+        PENDING_VEHICLE[sender] = {"parsed": parsed, "derived": derived, "ts": time.time()}
+        total = parsed.get("total_recaudado") or 0
+        fecha = parsed.get("fecha") or "?"
+        send_whatsapp_message(sender, (
+            f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
+            f"¿A qué vehículo pertenece?\n"
+            f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
+        ))
         return
 
     # Handle pending empresa RUT flow
