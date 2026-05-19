@@ -10,6 +10,7 @@ import logging
 import sys
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 from logging.handlers import RotatingFileHandler
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
@@ -32,6 +33,8 @@ START_TIME = time.time()
 
 DIAS_ES          = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 INITIAL_EMPRESAS = ["PUL", "Lumin Civil", "Lumin Energia", "MIDES", "Hospital"]
+UY_TZ            = ZoneInfo("America/Montevideo")
+RESPUESTAS_AFIRMATIVAS = {"SI", "SÍ", "DALE", "OK", "YES", "CONFIRMAR"}
 
 VEHICULOS = {
     "1": "Terminal",
@@ -153,7 +156,7 @@ PERSONA_PROMPT = """Sos Lito, el asistente secretarial de Jorge. Trabajás para 
 IDENTIDAD Y TONO:
 - Tratá a Jorge siempre de "usted" y usá su nombre con naturalidad
 - Sé cálido y profesional, como un secretario de confianza — nunca como un robot
-- Saludá según la hora del día: "Buenos días, Jorge" (hasta las 12), "Buenas tardes" (12–19), "Buenas noches" (19 en adelante)
+- Al saludar usá siempre el saludo indicado en el contexto (campo "Saludo actual")
 - Si Jorge te saluda o manda un mensaje casual al arrancar el día, respondé el saludo antes de cualquier dato
 - Usá frases cortas y directas — una o dos líneas por dato, sin explicaciones de más
 
@@ -204,6 +207,16 @@ def _build_image_prompt() -> str:
         "Si la imagen no es un formulario de recaudación o no podés extraer datos básicos respondé:\n"
         '{"error": "No se pudieron extraer los datos"}'
     )
+
+
+def get_saludo() -> str:
+    hora = datetime.now(UY_TZ).hour
+    if 6 <= hora < 12:
+        return "Buenos días"
+    elif 12 <= hora < 20:
+        return "Buenas tardes"
+    else:
+        return "Buenas noches"
 
 
 # ── logging ───────────────────────────────────────────────────────────────────
@@ -573,7 +586,7 @@ def process_image(image_url: str) -> str:
 
 def process_text(message_text: str) -> tuple:
     """Returns (text_response, tool_call_dict) — exactly one of them is None."""
-    now   = datetime.now()
+    now   = datetime.now(UY_TZ)
     stats = get_monthly_stats(now.month, now.year)
 
     conn = sqlite3.connect(DB_PATH)
@@ -599,6 +612,7 @@ def process_text(message_text: str) -> tuple:
     )
 
     context = (
+        f"Saludo actual: {get_saludo()}\n"
         f"Fecha y hora actual: {now.strftime('%A %d/%m/%Y %H:%M')} (Uruguay, UTC-3)\n\n"
         f"ESTADÍSTICAS DEL MES ACTUAL ({now.strftime('%m/%Y')}):\n"
         f"- Total recaudado: ${stats['total_recaudado']:.0f}\n"
@@ -1071,7 +1085,7 @@ def _handle_text(sender: str, message: dict):
         _cmd_add_empresa(sender, pending["nombre"], rut)
         return
 
-    if text.upper() in ("SI", "SÍ") and sender in PENDING_REPLACEMENTS:
+    if text.upper().strip() in RESPUESTAS_AFIRMATIVAS and sender in PENDING_REPLACEMENTS:
         pending = PENDING_REPLACEMENTS.pop(sender)
         try:
             _do_update(pending["existing_id"], pending["parsed"], pending["derived"])
