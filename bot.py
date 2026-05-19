@@ -489,11 +489,9 @@ def _derive_fields(fecha_str: str, parsed: dict) -> dict:
         dia_semana, semana_numero, mes, anio = None, None, None, None
 
     tr  = parsed.get("total_recaudado") or 0
-    c30 = parsed.get("comision_30")     or 0
     pos = parsed.get("total_pos")       or 0
-    fdo = parsed.get("total_fiado")     or 0
 
-    efectivo_neto      = round(tr - c30 - pos - fdo, 2)
+    efectivo_neto      = round(parsed.get("efectivo_empresa") or 0, 2)
     porcentaje_digital = round((pos / tr) * 100, 2) if tr else None
 
     return {
