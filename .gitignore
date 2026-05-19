@@ -1,0 +1,23 @@
+# Credentials — never commit
+.env
+
+# Database — contains real user data
+*.db
+*.db-shm
+*.db-wal
+
+# Logs — may contain phone numbers
+*.log
+
+# Python runtime
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Backups — not source code
+backups/
+*.bak
+
+# OS
+.DS_Store
