@@ -27,16 +27,30 @@ ALLOWED_NUMBERS   = set(filter(None, os.getenv("ALLOWED_NUMBERS", "").split(",")
 BASE_DIR   = "/home/ubuntu/asistente-lito"
 DB_PATH    = os.path.join(BASE_DIR, "recaudaciones.db")
 LOG_PATH   = os.path.join(BASE_DIR, "bot.log")
-VERSION    = "2.5.0"
+VERSION    = "2.6.0"
 START_TIME = time.time()
 
 DIAS_ES          = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 INITIAL_EMPRESAS = ["PUL", "Lumin Civil", "Lumin Energia", "MIDES", "Hospital"]
 
+VEHICULOS = {
+    "1": "Terminal",
+    "2": "Plaza",
+    "3": "Sanatorio",
+    "4": "Particular",
+    "terminal": "Terminal",
+    "plaza": "Plaza",
+    "sanatorio": "Sanatorio",
+    "particular": "Particular",
+}
+VEHICLE_TIMEOUT = 600  # 10 minutes
+
 # sender → {parsed, derived, existing_id, existing_total}
 PENDING_REPLACEMENTS: dict = {}
 # sender → {"nombre": str}  (waiting for RUT input)
 PENDING_EMPRESA: dict = {}
+# sender → {parsed, derived, ts}  (waiting for vehicle selection)
+PENDING_VEHICLE: dict = {}
 
 BOT_TOOLS = [
     {
@@ -233,6 +247,7 @@ EXPECTED_COLUMNS = {
     # legacy
     "monto":               "REAL",
     "descripcion":         "TEXT",
+    "vehiculo":            "TEXT",
 }
 
 
@@ -379,6 +394,7 @@ def init_db():
         id                  INTEGER PRIMARY KEY AUTOINCREMENT,
         fecha               TEXT,
         chofer              TEXT,
+        vehiculo            TEXT,
         total_recaudado     REAL,
         comision_30         REAL,
         total_pos           REAL,
@@ -561,16 +577,17 @@ def process_text(message_text: str) -> tuple:
     stats = get_monthly_stats(now.month, now.year)
 
     conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
     c = conn.cursor()
     c.execute("""SELECT fecha, dia_semana, chofer, total_recaudado, comision_30,
                         total_pos, total_fiado, efectivo_neto, porcentaje_digital,
-                        semana_numero
+                        semana_numero, vehiculo
                  FROM recaudaciones ORDER BY creado_en DESC LIMIT 60""")
     rows = c.fetchall()
     conn.close()
 
     registros = "\n".join([
-        f"- {r[0]} ({r[1] or '?'}) chofer:{r[2] or '?'} "
+        f"- {r[0]} ({r[1] or '?'}) chofer:{r[2] or '?'} vehiculo:{r['vehiculo'] or '?'} "
         f"total:${r[3] or 0:.0f} comision:${r[4] or 0:.0f} "
         f"pos:${r[5] or 0:.0f} fiado:${r[6] or 0:.0f} "
         f"neto:${r[7] or 0:.0f} digital:{r[8] or 0:.1f}% sem:{r[9] or '?'}"
@@ -859,13 +876,13 @@ def _do_insert(parsed: dict, derived: dict):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""INSERT INTO recaudaciones (
-        fecha, chofer,
+        fecha, chofer, vehiculo,
         total_recaudado, comision_30, total_pos, total_fiado,
         otros_combustible, efectivo_empresa,
         dia_semana, semana_numero, mes, anio,
         efectivo_neto, porcentaje_digital, creado_en
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
-        parsed.get("fecha"), parsed.get("chofer"),
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
+        parsed.get("fecha"), parsed.get("chofer"), parsed.get("vehiculo"),
         parsed.get("total_recaudado"), parsed.get("comision_30"),
         parsed.get("total_pos"), parsed.get("total_fiado"),
         parsed.get("otros_combustible"), parsed.get("efectivo_empresa"),
@@ -892,13 +909,13 @@ def _do_update(record_id: int, parsed: dict, derived: dict):
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     c.execute("""UPDATE recaudaciones SET
-        chofer=?, total_recaudado=?, comision_30=?, total_pos=?, total_fiado=?,
+        chofer=?, vehiculo=?, total_recaudado=?, comision_30=?, total_pos=?, total_fiado=?,
         otros_combustible=?, efectivo_empresa=?,
         dia_semana=?, semana_numero=?, mes=?, anio=?,
         efectivo_neto=?, porcentaje_digital=?, creado_en=?
         WHERE id=?""", (
-        parsed.get("chofer"), parsed.get("total_recaudado"), parsed.get("comision_30"),
-        parsed.get("total_pos"), parsed.get("total_fiado"),
+        parsed.get("chofer"), parsed.get("vehiculo"), parsed.get("total_recaudado"),
+        parsed.get("comision_30"), parsed.get("total_pos"), parsed.get("total_fiado"),
         parsed.get("otros_combustible"), parsed.get("efectivo_empresa"),
         derived["dia_semana"], derived["semana_numero"], derived["mes"], derived["anio"],
         derived["efectivo_neto"], derived["porcentaje_digital"],
@@ -919,16 +936,18 @@ def _do_update(record_id: int, parsed: dict, derived: dict):
 
 
 def _confirmation_msg(parsed: dict, derived: dict, verb: str) -> str:
-    chofer = parsed.get("chofer") or "sin nombre"
-    fecha  = parsed.get("fecha") or "?"
-    dia    = derived["dia_semana"] or ""
-    total  = parsed.get("total_recaudado") or 0
-    neto   = derived["efectivo_neto"] or 0
-    pos    = parsed.get("total_pos") or 0
-    pct    = derived["porcentaje_digital"] or 0
+    chofer   = parsed.get("chofer") or "sin nombre"
+    fecha    = parsed.get("fecha") or "?"
+    dia      = derived["dia_semana"] or ""
+    total    = parsed.get("total_recaudado") or 0
+    neto     = derived["efectivo_neto"] or 0
+    pos      = parsed.get("total_pos") or 0
+    pct      = derived["porcentaje_digital"] or 0
+    vehiculo = parsed.get("vehiculo") or "sin asignar"
     return (
         f"{verb} {fecha} ({dia})\n"
         f"Chofer: {chofer}\n"
+        f"Vehículo: {vehiculo}\n"
         f"Total: ${total:.0f}\n"
         f"Efectivo neto: ${neto:.0f}\n"
         f"POS: ${pos:.0f} ({pct:.1f}%)"
@@ -972,7 +991,49 @@ def _handle_image(sender: str, message: dict):
         if canonical:
             parsed["chofer"] = canonical
 
-        derived  = _derive_fields(fecha_str, parsed)
+        derived = _derive_fields(fecha_str, parsed)
+
+        PENDING_VEHICLE[sender] = {
+            "parsed": parsed,
+            "derived": derived,
+            "ts": time.time(),
+        }
+        total = parsed.get("total_recaudado") or 0
+        fecha = parsed.get("fecha") or "?"
+        log.info(f"Imagen procesada para {_mask(sender)}: ${total:.0f} del {fecha} — esperando vehículo")
+        send_whatsapp_message(sender, (
+            f"✅ Recaudación detectada: ${total:.0f} del {fecha}.\n\n"
+            f"¿A qué vehículo pertenece?\n"
+            f"1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
+        ))
+
+    except Exception as e:
+        log.error(f"Error procesando imagen de {_mask(sender)}: {e}\n{traceback.format_exc()}")
+        send_whatsapp_message(sender, "Hubo un error procesando la imagen. Intentá de nuevo en unos segundos.")
+
+
+def _handle_text(sender: str, message: dict):
+    text = message["text"]["body"].strip()
+
+    # Handle pending vehicle selection
+    if sender in PENDING_VEHICLE:
+        pending = PENDING_VEHICLE[sender]
+        if time.time() - pending["ts"] > VEHICLE_TIMEOUT:
+            PENDING_VEHICLE.pop(sender)
+            log.info(f"Selección de vehículo expirada para {_mask(sender)}")
+            send_whatsapp_message(sender, "La selección de vehículo expiró. Mandá la imagen nuevamente.")
+            return
+        vehiculo = VEHICULOS.get(text.strip().lower())
+        if vehiculo is None:
+            send_whatsapp_message(sender, (
+                "No reconocí el vehículo. Respondé con el número o nombre:\n"
+                "1️⃣ Terminal\n2️⃣ Plaza\n3️⃣ Sanatorio\n4️⃣ Particular"
+            ))
+            return
+        PENDING_VEHICLE.pop(sender)
+        parsed  = pending["parsed"]
+        derived = pending["derived"]
+        parsed["vehiculo"] = vehiculo
         existing = _find_existing(parsed.get("fecha"), parsed.get("chofer"))
         if existing:
             PENDING_REPLACEMENTS[sender] = {
@@ -990,27 +1051,18 @@ def _handle_image(sender: str, message: dict):
                 f"¿Querés reemplazarlo? Respondé SI para confirmar."
             ))
             return
-
         try:
             _do_insert(parsed, derived)
             log.info(
                 f"Recaudación guardada para {_mask(sender)}: "
-                f"chofer={parsed.get('chofer')} total=${parsed.get('total_recaudado')}"
+                f"chofer={parsed.get('chofer')} vehiculo={vehiculo} total=${parsed.get('total_recaudado')}"
             )
         except sqlite3.Error as db_err:
             log.error(f"Error al guardar en DB: {db_err}")
             send_whatsapp_message(sender, "Leí los datos pero hubo un error al guardarlos. Avisale al administrador.")
             return
-
         send_whatsapp_message(sender, _confirmation_msg(parsed, derived, "Guardado!"))
-
-    except Exception as e:
-        log.error(f"Error procesando imagen de {_mask(sender)}: {e}\n{traceback.format_exc()}")
-        send_whatsapp_message(sender, "Hubo un error procesando la imagen. Intentá de nuevo en unos segundos.")
-
-
-def _handle_text(sender: str, message: dict):
-    text = message["text"]["body"].strip()
+        return
 
     # Handle pending empresa RUT flow
     if sender in PENDING_EMPRESA:
