@@ -1154,18 +1154,28 @@ def _send_field_select_interactive(sender: str, parsed: dict):
     _fecha = parsed.get("fecha") or "?"
     _total = parsed.get("total_recaudado") or 0
     _ef    = parsed.get("efectivo_empresa") or 0
-    _chof  = parsed.get("chofer") or "sin nombre"
-    _veh   = parsed.get("vehiculo") or "sin asignar"
+    _pos   = parsed.get("total_pos") or 0
+    _com   = parsed.get("comision_30") or 0
+    _fiado = parsed.get("total_fiado") or 0
+    _pul   = parsed.get("empresa_pul") or 0
+    _mides = parsed.get("empresa_mides") or 0
+    _hosp  = parsed.get("empresa_hospital") or 0
+    _comb  = parsed.get("otros_combustible") or 0
     send_interactive_list(
         sender,
         "¿Qué campo querés corregir?",
         "Ver campos",
         [{"title": "Campos", "rows": [
-            {"id": "1", "title": "Fecha",       "description": str(_fecha)},
-            {"id": "2", "title": "Total",       "description": f"${_total:.0f}"},
-            {"id": "3", "title": "Ef. empresa", "description": f"${_ef:.0f}"},
-            {"id": "4", "title": "Chofer",      "description": str(_chof)},
-            {"id": "5", "title": "Vehículo",    "description": str(_veh)},
+            {"id": "1",  "title": "Fecha",       "description": str(_fecha)},
+            {"id": "2",  "title": "Total",       "description": f"${_total:.0f}"},
+            {"id": "3",  "title": "Ef. empresa", "description": f"${_ef:.0f}"},
+            {"id": "4",  "title": "POS",         "description": f"${_pos:.0f}"},
+            {"id": "5",  "title": "Comisión",    "description": f"${_com:.0f}"},
+            {"id": "6",  "title": "Fiado",       "description": f"${_fiado:.0f}"},
+            {"id": "7",  "title": "PUL",         "description": f"${_pul:.0f}"},
+            {"id": "8",  "title": "MIDES",       "description": f"${_mides:.0f}"},
+            {"id": "9",  "title": "Hospital",    "description": f"${_hosp:.0f}"},
+            {"id": "10", "title": "Combustible", "description": f"${_comb:.0f}"},
         ]}],
     )
 
@@ -1299,11 +1309,16 @@ def _handle_text(sender: str, message: dict):
         # ── substate: waiting for field selection ─────────────────────
         if substate == "field_select":
             _MENU = {
-                "1": ("fecha",            "Fecha"),
-                "2": ("total_recaudado",  "Total"),
-                "3": ("efectivo_empresa", "Efectivo empresa"),
-                "4": ("chofer",           "Chofer"),
-                "5": ("vehiculo",         "Vehículo"),
+                "1":  ("fecha",             "Fecha"),
+                "2":  ("total_recaudado",   "Total"),
+                "3":  ("efectivo_empresa",  "Efectivo empresa"),
+                "4":  ("total_pos",         "POS"),
+                "5":  ("comision_30",       "Comisión"),
+                "6":  ("total_fiado",       "Fiado"),
+                "7":  ("empresa_pul",       "PUL"),
+                "8":  ("empresa_mides",     "MIDES"),
+                "9":  ("empresa_hospital",  "Hospital"),
+                "10": ("otros_combustible", "Combustible"),
             }
             if text.strip() in _MENU:
                 campo_db, label = _MENU[text.strip()]
