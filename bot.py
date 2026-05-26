@@ -17,6 +17,19 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from dashboard import setup_dashboard, dashboard_router
+from oca_client import OCAClient
+
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler as _BGScheduler
+    _APSCHEDULER_OK = True
+except ImportError:
+    _APSCHEDULER_OK = False
+
+try:
+    import fiserv_sync as _fiserv
+    _FISERV_OK = True
+except ImportError:
+    _FISERV_OK = False
 
 load_dotenv()
 
@@ -66,6 +79,11 @@ PENDING_CHOFER_OCR: dict = {}
 PENDING_CHOFER_CONFIRM: dict = {}
 # sender → {parsed, derived, ts}  (waiting for pre-save confirmation / field corrections)
 PENDING_CONFIRM: dict = {}
+
+# sender → {"messages": [{role, content}, ...], "last_ts": float}
+CONVERSATION_HISTORY: dict[str, dict] = {}
+HISTORY_MAX_TURNS = 10   # 10 user + 10 assistant = 20 messages max
+HISTORY_TTL       = 7200  # 2 hours without activity clears history
 
 BOT_TOOLS = [
     {
@@ -276,6 +294,18 @@ log = _setup_logging()
 app = FastAPI()
 client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
+_oca_client: OCAClient | None = None
+
+
+def _get_oca_client() -> OCAClient | None:
+    global _oca_client
+    if _oca_client is None:
+        try:
+            _oca_client = OCAClient()
+        except KeyError:
+            return None
+    return _oca_client
+
 
 # ── DB schema & migration ─────────────────────────────────────────────────────
 
@@ -476,6 +506,24 @@ app.include_router(dashboard_router)
 log.info(f"Bot iniciado — version {VERSION}")
 
 
+def _run_fiserv_sync_safe():
+    if not _FISERV_OK:
+        return
+    try:
+        _fiserv.run_fiserv_sync()
+    except Exception as e:
+        log.error(f"Error en sync Fiserv programado: {e}")
+
+
+if _APSCHEDULER_OK and _FISERV_OK:
+    import atexit
+    _scheduler = _BGScheduler()
+    _scheduler.add_job(_run_fiserv_sync_safe, "interval", hours=6, id="fiserv_sync")
+    _scheduler.start()
+    atexit.register(_scheduler.shutdown)
+    log.info("Scheduler Fiserv iniciado (cada 6 h)")
+
+
 # ── field derivation ──────────────────────────────────────────────────────────
 
 def _derive_fields(fecha_str: str, parsed: dict) -> dict:
@@ -673,7 +721,7 @@ def process_image(image_url: str) -> str:
     return response.content[0].text
 
 
-def process_text(message_text: str) -> tuple:
+def process_text(message_text: str, history: list[dict] | None = None) -> tuple:
     """Returns (text_response, tool_call_dict) — exactly one of them is None."""
     now   = datetime.now(UY_TZ)
     stats = get_monthly_stats(now.month, now.year)
@@ -700,7 +748,7 @@ def process_text(message_text: str) -> tuple:
         f"{e['empresa']}:${e['total']:.0f}" for e in stats.get("by_empresa", [])
     )
 
-    context = (
+    context_header = (
         f"Saludo actual: {get_saludo()}\n"
         f"Fecha y hora actual: {now.strftime('%A %d/%m/%Y %H:%M')} (Uruguay, UTC-3)\n\n"
         f"ESTADÍSTICAS DEL MES ACTUAL ({now.strftime('%m/%Y')}):\n"
@@ -712,18 +760,25 @@ def process_text(message_text: str) -> tuple:
         f" | Efectivo neto: ${stats['pagos']['efectivo_neto']:.0f}\n"
         f"- Por empresa: {empresa_str or 'sin datos'}\n"
         f"- Por chofer: {json.dumps(stats['by_chofer'], ensure_ascii=False)}\n\n"
-        f"ÚLTIMOS 60 REGISTROS:\n{registros}\n\n"
-        f"Mensaje de Jorge: {message_text}"
+        f"ÚLTIMOS 60 REGISTROS:\n{registros}"
     )
+
+    # System prompt always carries fresh context so history messages stay clean
+    system = PERSONA_PROMPT + "\n\n---\n" + context_header
+
+    if history:
+        messages = list(history) + [{"role": "user", "content": message_text}]
+    else:
+        messages = [{"role": "user", "content": message_text}]
 
     for attempt in range(2):
         try:
             response = client.messages.create(
                 model="claude-sonnet-4-5",
                 max_tokens=1000,
-                system=PERSONA_PROMPT,
+                system=system,
                 tools=BOT_TOOLS,
-                messages=[{"role": "user", "content": context}]
+                messages=messages,
             )
             break
         except anthropic.InternalServerError:
@@ -739,6 +794,569 @@ def process_text(message_text: str) -> tuple:
 
     text = next((b.text for b in response.content if hasattr(b, "text")), "")
     return text, None
+
+
+# ── OCA Comercios ─────────────────────────────────────────────────────────────
+
+import calendar as _calendar
+
+_MONEDAS_OCA = {"0858": "UYU", "840": "USD", "858": "UYU"}
+_MESES_ABREV = ["", "Ene", "Feb", "Mar", "Abr", "May", "Jun",
+                "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+_MESES_FULL  = ["", "Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio",
+                "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"]
+
+
+def _fmt_oca(amount: float) -> str:
+    """Format amount in UY style: 45.320"""
+    return f"{round(amount):,}".replace(",", ".")
+
+
+def _moneda_oca(cod: str) -> str:
+    return _MONEDAS_OCA.get(str(cod), str(cod))
+
+
+def _primary_total(month_data: dict[str, float]) -> float:
+    return month_data.get("UYU", sum(month_data.values()))
+
+
+# ── intent detection ──────────────────────────────────────────────────────────
+
+def _detect_oca_intent(text: str, now: datetime, history: list[dict] | None = None) -> dict | None:
+    """Detect OCA query intent. Returns intent dict or None if not OCA.
+
+    Intent types:
+      {"type": "range",       "start_date": ..., "end_date": ...}
+      {"type": "best_month",  "year": int}
+      {"type": "worst_month", "year": int}
+      {"type": "year_summary","year": int}
+      {"type": "comparison",  "periods": [{"label":..,"start_date":..,"end_date":..},...]}
+      None  →  not an OCA query
+    """
+    history_block = ""
+    if history:
+        lines = [
+            f"{'Usuario' if m['role'] == 'user' else 'Lito'}: {m['content'][:300]}"
+            for m in history[-4:]
+        ]
+        history_block = "Historial reciente:\n" + "\n".join(lines) + "\n\n"
+
+    prompt = (
+        f"Hoy es {now.strftime('%Y-%m-%d')} (Uruguay).\n\n"
+        + history_block
+        + f"Nuevo mensaje: \"{text}\"\n\n"
+        "Determiná si es una consulta sobre pagos/depósitos de OCA y su tipo.\n\n"
+        "TIPOS DE RESPUESTA (elegí exactamente uno):\n\n"
+        "1. Rango de fechas simple:\n"
+        "   {\"type\":\"range\",\"start_date\":\"YYYY-MM-DD\",\"end_date\":\"YYYY-MM-DD\"}\n"
+        "   Ej: 'pagos de mayo', 'cuánto depositó OCA esta semana', 'y el mes pasado?'\n\n"
+        "2. Mejor mes del año:\n"
+        f"   {{\"type\":\"best_month\",\"year\":{now.year}}}\n"
+        "   Ej: 'mejor mes', 'en qué mes pagaron más', 'qué mes fue el mejor'\n\n"
+        "3. Peor mes del año:\n"
+        f"   {{\"type\":\"worst_month\",\"year\":{now.year}}}\n"
+        "   Ej: 'peor mes', 'mes que menos depositaron', 'y el peor?' (tras ver ranking)\n\n"
+        "4. Resumen del año:\n"
+        f"   {{\"type\":\"year_summary\",\"year\":{now.year}}}\n"
+        "   Ej: 'cómo viene el año', 'resumen del 2026', 'cuánto va el año'\n\n"
+        "5. Comparación entre períodos:\n"
+        "   {\"type\":\"comparison\",\"periods\":["
+        "{\"label\":\"enero\",\"start_date\":\"YYYY-MM-DD\",\"end_date\":\"YYYY-MM-DD\"},"
+        "{\"label\":\"febrero\",\"start_date\":\"YYYY-MM-DD\",\"end_date\":\"YYYY-MM-DD\"}]}\n"
+        "   Ej: 'comparar enero y febrero', 'diferencia entre marzo y abril', 'cuánto más que el mes pasado'\n\n"
+        "6. No es OCA: {\"type\":\"none\"}\n\n"
+        "CONTINUIDAD DE CONTEXTO:\n"
+        "- 'y el mes pasado?', 'y enero?', 'y la semana pasada?' tras OCA → type range\n"
+        "- 'y el peor?' tras ver ranking → type worst_month\n"
+        "- 'cuánto me depositaron en X' → range para X\n\n"
+        "NO es OCA aunque el historial sea OCA:\n"
+        "- Verbos en primera persona sobre lo que el usuario recaudó ('cuánto recaudé?', 'cuánto junté?', 'cuánto cobré?')\n"
+        "- Consultas sobre choferes, vehículos o empresas del sistema\n"
+        "- Saludos o consultas no financieras\n"
+        "- Consultas genéricas sobre 'POS' o 'terminales' sin mencionar OCA explícitamente\n"
+        "  Ej: 'cuánto recaudaron los POS', 'total de los terminales este mes' → siempre {\"type\":\"none\"}\n\n"
+        "REGLAS DE FECHAS para type range:\n"
+        "- 'esta semana' = lunes a domingo de la semana actual\n"
+        "- 'semana pasada' = semana anterior completa\n"
+        f"- nombre de mes sin año (ej 'enero') = {now.year}-01-01 a {now.year}-01-31\n"
+        "- 'mes pasado' = primer y último día del mes anterior\n"
+        "- 'este mes' = primer día del mes actual a hoy\n\n"
+        "Respondé SOLO con el JSON, sin texto adicional."
+    )
+    resp = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw = resp.content[0].text.strip()
+    match = re.search(r'\{.*\}', raw, re.DOTALL)
+    if not match:
+        return None
+    data = json.loads(match.group())
+    if data.get("type") in (None, "none", ""):
+        return None
+    return data
+
+
+_COMBINED_PROCESSORS = {"OCA", "FISERV", "FIRSTDATA"}
+_COMBINED_POS_KW     = {"POS", "POSNET", "TERMINAL", "TERMINALES"}
+
+
+def _detect_combined_intent(text: str, now: datetime, history: list[dict] | None = None) -> dict | None:
+    """Detect generic POS queries that need OCA + Fiserv combined response.
+    Uses a keyword pre-filter to avoid Claude calls for clearly non-POS messages.
+    Returns {"type":"combined","start_date":...,"end_date":...} or None.
+    """
+    text_upper = text.upper()
+    # Only proceed if the message has a generic POS keyword but NOT a specific processor name
+    if not any(k in text_upper for k in _COMBINED_POS_KW):
+        return None
+    if any(k in text_upper for k in _COMBINED_PROCESSORS):
+        return None
+
+    history_block = ""
+    if history:
+        lines = [
+            f"{'Usuario' if m['role'] == 'user' else 'Lito'}: {m['content'][:200]}"
+            for m in history[-4:]
+        ]
+        history_block = "Historial reciente:\n" + "\n".join(lines) + "\n\n"
+
+    prompt = (
+        f"Hoy es {now.strftime('%Y-%m-%d')} (Uruguay).\n\n"
+        + history_block
+        + f"Nuevo mensaje: \"{text}\"\n\n"
+        "Determiná si es una consulta sobre totales de POS (terminales de cobro con tarjeta)\n"
+        "de forma GENÉRICA, sin especificar OCA ni Fiserv.\n\n"
+        "Si es una consulta genérica de POS, respondé con las fechas del período:\n"
+        '{"type":"combined","start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}\n\n'
+        "Si no es una consulta de POS genérica, respondé:\n"
+        '{"type":"none"}\n\n'
+        "EJEMPLOS combinados (usar combined):\n"
+        "- 'cuánto recaudaron los POS este mes'\n"
+        "- 'cuánto cobré en total con los terminales'\n"
+        "- 'recaudación de los POS la semana pasada'\n"
+        "- 'cuánto entraron los POS en mayo'\n\n"
+        "EJEMPLOS no combinados (usar none):\n"
+        "- 'cuánto recaudé hoy' (recaudación interna, no POS)\n"
+        "- 'total de choferes esta semana' (consulta interna)\n\n"
+        "REGLAS DE FECHAS:\n"
+        "- 'esta semana' = lunes a domingo actual\n"
+        "- 'semana pasada' = semana anterior completa\n"
+        f"- nombre de mes (ej 'mayo') = {now.year}-MM-01 al último día\n"
+        "- 'mes pasado' = primer y último día del mes anterior\n"
+        "- 'este mes' = primer día del mes actual a hoy\n\n"
+        "Respondé SOLO con el JSON."
+    )
+    resp  = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=100,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw   = resp.content[0].text.strip()
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        return None
+    data = json.loads(match.group())
+    if data.get("type") == "combined":
+        return data
+    return None
+
+
+# ── per-type handlers ─────────────────────────────────────────────────────────
+
+def _oca_handle_range(oca, start_date: str, end_date: str) -> str:
+    pagos = oca.get_pagos(start_date, end_date)
+    d1    = datetime.strptime(start_date, "%Y-%m-%d")
+    d2    = datetime.strptime(end_date,   "%Y-%m-%d")
+    rango = f"{d1.strftime('%d/%m/%Y')} al {d2.strftime('%d/%m/%Y')}"
+
+    if not pagos:
+        return f"*OCA — {rango}*\nNo hubo pagos en ese período."
+
+    totales: dict[str, float] = {}
+    detalle: list[tuple] = []
+    for p in pagos:
+        moneda = _moneda_oca(p.get("cod_moneda", "UYU"))
+        monto  = float(p.get("monto", 0))
+        totales[moneda] = totales.get(moneda, 0) + monto
+        detalle.append((p.get("fecha_vencimiento", ""), monto, moneda))
+
+    detalle.sort(key=lambda x: x[0])
+    lines = [f"*OCA — {rango}*"]
+    if len(pagos) <= 12:
+        for fecha_v, monto, moneda in detalle:
+            try:
+                fecha_fmt = datetime.strptime(fecha_v, "%Y-%m-%d").strftime("%d/%m")
+            except ValueError:
+                fecha_fmt = fecha_v
+            suffix = f" {moneda}" if moneda != "UYU" else ""
+            lines.append(f"  {fecha_fmt}: ${_fmt_oca(monto)}{suffix}")
+        lines.append("")
+    else:
+        lines.append(f"({len(pagos)} pagos en el período)\n")
+    for moneda, total in totales.items():
+        suffix = f" {moneda}" if moneda != "UYU" else ""
+        lines.append(f"*Total: ${_fmt_oca(total)}{suffix}*")
+    return "\n".join(lines)
+
+
+def _oca_pagos_by_month(oca, year: int, up_to_month: int) -> dict[int, dict[str, float]]:
+    """Single API call for a year range, grouped by month of fecha_vencimiento."""
+    last_day = _calendar.monthrange(year, up_to_month)[1]
+    pagos    = oca.get_pagos(f"{year}-01-01", f"{year}-{up_to_month:02d}-{last_day:02d}")
+    by_month: dict[int, dict[str, float]] = {}
+    for p in pagos:
+        fecha_v = p.get("fecha_vencimiento", "")
+        if not fecha_v:
+            continue
+        try:
+            month = datetime.strptime(fecha_v, "%Y-%m-%d").month
+        except ValueError:
+            continue
+        moneda     = _moneda_oca(p.get("cod_moneda", "UYU"))
+        monto      = float(p.get("monto", 0))
+        month_data = by_month.setdefault(month, {})
+        month_data[moneda] = month_data.get(moneda, 0) + monto
+    return by_month
+
+
+def _oca_handle_best_worst(oca, year: int, mode: str, now: datetime) -> str:
+    up_to   = now.month if year == now.year else 12
+    by_month = _oca_pagos_by_month(oca, year, up_to)
+    if not by_month:
+        return f"Sin pagos de OCA en {year}."
+
+    ranked = sorted(by_month.items(), key=lambda x: _primary_total(x[1]), reverse=True)
+    winner_m, winner_data = ranked[0]
+    loser_m,  loser_data  = ranked[-1]
+
+    if mode == "best_month":
+        subject_m, subject_data = winner_m, winner_data
+        title = f"Mejor mes OCA {year}"
+    else:
+        subject_m, subject_data = loser_m, loser_data
+        title = f"Peor mes OCA {year}"
+
+    lines = [
+        f"*{title}*",
+        f"{_MESES_FULL[subject_m]}: ${_fmt_oca(_primary_total(subject_data))} UYU",
+        "",
+        "Ranking:",
+    ]
+    for i, (m, data) in enumerate(ranked):
+        lines.append(f"  {i+1}. {_MESES_FULL[m]}: ${_fmt_oca(_primary_total(data))}")
+    return "\n".join(lines)
+
+
+def _oca_handle_year_summary(oca, year: int, now: datetime) -> str:
+    up_to    = now.month if year == now.year else 12
+    by_month = _oca_pagos_by_month(oca, year, up_to)
+    if not by_month:
+        return f"Sin pagos de OCA en {year}."
+
+    year_total = sum(_primary_total(d) for d in by_month.values())
+    lines = [f"*OCA {year}*", ""]
+    for m in range(1, up_to + 1):
+        data  = by_month.get(m, {})
+        total = _primary_total(data)
+        bar   = f"${_fmt_oca(total)}" if total > 0 else "—"
+        lines.append(f"  {_MESES_ABREV[m]}: {bar}")
+    lines += ["", f"*Total: ${_fmt_oca(year_total)} UYU*"]
+    return "\n".join(lines)
+
+
+def _oca_handle_comparison(oca, periods: list[dict]) -> str:
+    if not periods:
+        return "No pude determinar los períodos a comparar."
+
+    results = []
+    for period in periods:
+        label = period.get("label", "período")
+        start = period.get("start_date", "")
+        end   = period.get("end_date",   "")
+        if not start or not end:
+            continue
+        pagos = oca.get_pagos(start, end)
+        total = sum(float(p.get("monto", 0)) for p in pagos
+                    if _moneda_oca(p.get("cod_moneda", "UYU")) == "UYU")
+        results.append({"label": label, "total": total, "count": len(pagos)})
+
+    if not results:
+        return "No encontré datos para los períodos indicados."
+
+    results.sort(key=lambda x: x["total"], reverse=True)
+    lines = ["*OCA — Comparación*", ""]
+    for i, r in enumerate(results):
+        lines.append(f"  {i+1}. {r['label'].capitalize()}: ${_fmt_oca(r['total'])}")
+
+    if len(results) == 2:
+        diff   = abs(results[0]["total"] - results[1]["total"])
+        winner = results[0]["label"].capitalize()
+        lines += ["", f"Diferencia: ${_fmt_oca(diff)} a favor de *{winner}*"]
+    return "\n".join(lines)
+
+
+# ── dispatcher ────────────────────────────────────────────────────────────────
+
+def _handle_oca_query(sender: str, text: str, history: list[dict] | None = None) -> tuple[bool, str | None]:
+    """Detect and handle OCA payment queries. Returns (True, response) if handled."""
+    oca = _get_oca_client()
+    if oca is None:
+        return False, None
+
+    now = datetime.now(UY_TZ)
+    try:
+        intent = _detect_oca_intent(text, now, history)
+    except Exception as e:
+        log.error(f"Error detectando intención OCA: {e}")
+        return False, None
+
+    if not intent:
+        return False, None
+
+    itype = intent.get("type")
+    log.info(f"OCA intent '{itype}' para {_mask(sender)}")
+    _POS_KW = {"POS", "FISERV", "VISA", "MASTER", "DÉBITO", "DEBITO", "TARJETA"}
+    if any(k in text.upper() for k in _POS_KW):
+        log.warning(f"OCA interceptó mensaje con keyword POS/Fiserv (intent='{itype}'): '{text[:120]}'")
+
+    try:
+        if itype == "range":
+            msg = _oca_handle_range(oca, intent["start_date"], intent["end_date"])
+        elif itype == "best_month":
+            msg = _oca_handle_best_worst(oca, intent.get("year", now.year), "best_month", now)
+        elif itype == "worst_month":
+            msg = _oca_handle_best_worst(oca, intent.get("year", now.year), "worst_month", now)
+        elif itype == "year_summary":
+            msg = _oca_handle_year_summary(oca, intent.get("year", now.year), now)
+        elif itype == "comparison":
+            msg = _oca_handle_comparison(oca, intent.get("periods", []))
+        else:
+            return False, None
+    except requests.RequestException as e:
+        log.error(f"Error API OCA ({itype}): {e}")
+        return True, "No pude conectarme a la API de OCA. Intentá de nuevo en unos minutos."
+
+    return True, msg
+
+
+def _handle_combined_query(sender: str, text: str, history: list[dict] | None = None) -> tuple[bool, str | None]:
+    """Handle generic POS queries requiring OCA + Fiserv combined response."""
+    if not _FISERV_OK:
+        return False, None
+    now = datetime.now(UY_TZ)
+    try:
+        intent = _detect_combined_intent(text, now, history)
+    except Exception as e:
+        log.error(f"Error detectando intención combinada: {e}")
+        return False, None
+    if not intent:
+        return False, None
+    log.info(f"Combined POS intent para {_mask(sender)}: {intent['start_date']}–{intent['end_date']}")
+    try:
+        return True, _combined_msg(intent["start_date"], intent["end_date"])
+    except Exception as e:
+        log.error(f"Error en combined_msg: {e}\n{traceback.format_exc()}")
+        return True, "Hubo un error consultando los datos combinados. Intentá de nuevo."
+
+
+# ── Fiserv WhatsApp integration ───────────────────────────────────────────────
+
+def _detect_fiserv_intent(text: str, now: datetime, history: list[dict] | None = None) -> dict | None:
+    """Detect Fiserv / combined-source query intent.
+    Returns intent dict or None if not relevant.
+
+    Types:
+      {"type": "fiserv_range",  "start_date": ..., "end_date": ...}
+      {"type": "fiserv_sync"}
+      {"type": "combined",      "start_date": ..., "end_date": ...}
+      None
+    """
+    history_block = ""
+    if history:
+        lines = [
+            f"{'Usuario' if m['role'] == 'user' else 'Lito'}: {m['content'][:200]}"
+            for m in history[-4:]
+        ]
+        history_block = "Historial reciente:\n" + "\n".join(lines) + "\n\n"
+
+    prompt = (
+        f"Hoy es {now.strftime('%Y-%m-%d')} (Uruguay).\n\n"
+        + history_block
+        + f"Nuevo mensaje: \"{text}\"\n\n"
+        "Determiná si es una consulta sobre Fiserv (procesadora Visa/Mastercard/débito) "
+        "o una consulta combinada de todos los medios de pago.\n\n"
+        "TIPOS (elegí exactamente uno):\n\n"
+        "1. Consulta de datos Fiserv por período:\n"
+        '   {"type":"fiserv_range","start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}\n'
+        "   Ej: 'cuánto facturé con Fiserv esta semana', 'comisión Fiserv de mayo',\n"
+        "       'resumen Fiserv del mes pasado', 'cuánto con débito esta semana',\n"
+        "       'cuándo llega el próximo pago de Fiserv'\n\n"
+        "2. Forzar sincronización:\n"
+        '   {"type":"fiserv_sync"}\n'
+        "   Ej: 'actualizá Fiserv', 'bajá los datos de Fiserv', 'sync Fiserv'\n\n"
+        "3. Total combinado OCA + Fiserv:\n"
+        '   {"type":"combined","start_date":"YYYY-MM-DD","end_date":"YYYY-MM-DD"}\n'
+        "   Ej: 'cuánto cobré en total esta semana', 'total entre OCA y Fiserv',\n"
+        "       'qué conviene más OCA o Fiserv', 'todo junto'\n\n"
+        '4. No es Fiserv ni combinado: {"type":"none"}\n\n'
+        "NO es Fiserv ni combinado:\n"
+        "- Verbos en primera persona sobre recaudaciones propias ('recaudé', 'junté', 'cobré') "
+        "sin mencionar Fiserv/OCA ni pedir comparación\n"
+        "- Consultas sobre choferes, vehículos o empresas del sistema\n"
+        "- Saludos\n"
+        "- Consultas solo de OCA sin pedir comparación total\n\n"
+        "REGLAS DE FECHAS:\n"
+        "- 'esta semana' = lunes a domingo actual\n"
+        "- 'semana pasada' = semana anterior completa\n"
+        f"- nombre de mes (ej 'mayo') = {now.year}-MM-01 al último día del mes\n"
+        "- 'mes pasado' = primer y último día del mes anterior\n"
+        "- 'este mes' = primer día del mes actual a hoy\n"
+        "- Para 'próximo pago': usar start_date=hoy, end_date=fin del mes siguiente\n\n"
+        "Respondé SOLO con el JSON."
+    )
+    resp  = client.messages.create(
+        model="claude-haiku-4-5-20251001",
+        max_tokens=150,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    raw   = resp.content[0].text.strip()
+    match = re.search(r"\{.*\}", raw, re.DOTALL)
+    if not match:
+        log.warning(f"_detect_fiserv_intent sin JSON en respuesta: {raw[:200]}")
+        return None
+    data = json.loads(match.group())
+    if data.get("type") in (None, "none", ""):
+        return None
+    return data
+
+
+def _fmt_fiserv(amount: float) -> str:
+    return _fmt_oca(amount)
+
+
+def _fiserv_range_msg(start_date: str, end_date: str) -> str:
+    data  = _fiserv.get_fiserv_data(start_date, end_date)
+    d1    = datetime.strptime(start_date, "%Y-%m-%d")
+    d2    = datetime.strptime(end_date,   "%Y-%m-%d")
+    rango = f"{d1.strftime('%d/%m/%Y')} al {d2.strftime('%d/%m/%Y')}"
+
+    rango_real = (
+        f"{data['real_desde']} al {data['real_hasta']}"
+        if data.get("real_desde") and data.get("real_hasta")
+        else rango
+    )
+
+    if not data["conceptos"]:
+        err = data.get("error", "")
+        note = f"\n{err}" if err else "\nUsá *actualizá Fiserv* para sincronizar."
+        return f"*Fiserv — {rango_real}*\nNo hay datos para ese período.{note}"
+
+    lines = [f"*Fiserv — {rango_real}*", ""]
+    for c in data["conceptos"]:
+        lines.append(f"  {c['concepto']}: ${_fmt_fiserv(c['neto_a_cobrar'])}")
+    lines += ["", f"*Total neto: ${_fmt_fiserv(data['total_neto'])}*"]
+    return "\n".join(lines)
+
+
+def _do_fiserv_sync_msg() -> str:
+    result = _fiserv.run_fiserv_sync()
+    lines  = ["*Fiserv sincronizado*", ""]
+    if result["procesados"] == 0 and result["errores"] == 0:
+        lines.append("Sin liquidaciones nuevas.")
+    else:
+        lines.append(f"{result['procesados']} liquidaciones procesadas")
+        if result["errores"]:
+            lines.append(f"{result['errores']} con errores (ver fiserv_sync.log)")
+    if result.get("sheets_url"):
+        lines += ["", result["sheets_url"]]
+    return "\n".join(lines)
+
+
+def _combined_msg(start_date: str, end_date: str) -> str:
+    d1        = datetime.strptime(start_date, "%Y-%m-%d")
+    d2        = datetime.strptime(end_date,   "%Y-%m-%d")
+    rango_req = f"{d1.strftime('%d/%m/%Y')} al {d2.strftime('%d/%m/%Y')}"
+    rango_real = rango_req  # updated below once we have real Fiserv dates
+
+    body: list[str] = []
+
+    oca_neto: float | None = None
+    oca       = _get_oca_client()
+    if oca:
+        try:
+            pagos    = oca.get_pagos(start_date, end_date)
+            oca_neto = sum(
+                float(p.get("monto", 0)) for p in pagos
+                if _moneda_oca(p.get("cod_moneda", "")) == "UYU"
+            )
+            body.append(f"* OCA: ${_fmt_oca(oca_neto)}")
+        except Exception as e:
+            log.warning(f"Error OCA en combined: {e}")
+            body.append("* OCA: no disponible")
+
+    fiserv_neto: float | None = None
+    if _FISERV_OK:
+        try:
+            fd          = _fiserv.get_fiserv_data(start_date, end_date)
+            log.info(
+                f"Fiserv Sheets devolvió: neto={fd['total_neto']} "
+                f"venta={fd['total_venta']} conceptos={len(fd.get('conceptos', []))} "
+                f"error='{fd.get('error', '')}'"
+            )
+            fiserv_neto = fd["total_neto"]
+            if fd.get("real_desde") and fd.get("real_hasta"):
+                rango_real = f"{fd['real_desde']} al {fd['real_hasta']}"
+            body.append(f"* Fiserv: ${_fmt_fiserv(fiserv_neto)}")
+        except Exception as e:
+            log.warning(f"Error Fiserv en combined: {e}\n{traceback.format_exc()}")
+            body.append("* Fiserv: no disponible")
+    else:
+        log.warning("_FISERV_OK=False — fiserv_sync no importó, Fiserv omitido en combined")
+
+    lines = [f"*POS — {rango_real}*", ""] + body
+
+    if oca_neto is not None or fiserv_neto is not None:
+        grand = (oca_neto or 0) + (fiserv_neto or 0)
+        lines += ["", f"*Total: ${_fmt_oca(grand)}*"]
+
+    return "\n".join(lines)
+
+
+def _handle_fiserv_query(sender: str, text: str, history: list[dict] | None = None) -> tuple[bool, str | None]:
+    """Detect and handle Fiserv / combined queries. Returns (True, response) if handled."""
+    if not _FISERV_OK:
+        log.warning("_FISERV_OK=False — fiserv_sync no importó correctamente")
+        return False, None
+
+    now = datetime.now(UY_TZ)
+    try:
+        intent = _detect_fiserv_intent(text, now, history)
+    except Exception as e:
+        log.error(f"Error detectando intención Fiserv: {e}")
+        return False, None
+
+    if not intent:
+        return False, None
+
+    itype = intent.get("type")
+    log.info(f"Fiserv intent '{itype}' para {_mask(sender)}")
+
+    try:
+        if itype == "fiserv_range":
+            return True, _fiserv_range_msg(intent["start_date"], intent["end_date"])
+        if itype == "fiserv_sync":
+            return True, _do_fiserv_sync_msg()
+        if itype == "combined":
+            return True, _combined_msg(intent["start_date"], intent["end_date"])
+        return False, None
+    except requests.RequestException as e:
+        log.error(f"Error de red en Fiserv ({itype}): {e}")
+        return True, "No pude obtener los datos. Intentá de nuevo en un momento."
+    except Exception as e:
+        log.error(f"Error en Fiserv ({itype}): {e}\n{traceback.format_exc()}")
+        return True, "Hubo un error consultando datos de Fiserv. Intentá de nuevo."
 
 
 # ── message handlers ──────────────────────────────────────────────────────────
@@ -1215,6 +1833,27 @@ def _resolve_chofer_and_continue(sender: str, parsed: dict, fecha_str: str, nomb
         _send_chofer_disambiguation_list(sender, matches)
 
 
+# ── conversation history ──────────────────────────────────────────────────────
+
+def _get_history(sender: str) -> list[dict]:
+    entry = CONVERSATION_HISTORY.get(sender)
+    if not entry:
+        return []
+    if time.time() - entry["last_ts"] > HISTORY_TTL:
+        CONVERSATION_HISTORY.pop(sender, None)
+        return []
+    return list(entry["messages"])
+
+
+def _add_to_history(sender: str, role: str, content: str):
+    entry = CONVERSATION_HISTORY.setdefault(sender, {"messages": [], "last_ts": 0})
+    entry["messages"].append({"role": role, "content": content})
+    entry["last_ts"] = time.time()
+    max_msgs = HISTORY_MAX_TURNS * 2
+    if len(entry["messages"]) > max_msgs:
+        entry["messages"] = entry["messages"][-max_msgs:]
+
+
 def _handle_image(sender: str, message: dict):
     image_id = message["image"]["id"]
     try:
@@ -1546,28 +2185,65 @@ def _handle_text(sender: str, message: dict):
         PENDING_REPLACEMENTS.pop(sender)
         log.info(f"Reemplazo cancelado para {_mask(sender)}")
 
+    # ── history-aware section ─────────────────────────────────────────────────
+    history = _get_history(sender)
+
+    combined_handled, combined_response = _handle_combined_query(sender, text, history)
+    if combined_handled:
+        _add_to_history(sender, "user", text)
+        if combined_response:
+            send_whatsapp_message(sender, combined_response)
+            _add_to_history(sender, "assistant", combined_response)
+        return
+
+    oca_handled, oca_response = _handle_oca_query(sender, text, history)
+    if oca_handled:
+        _add_to_history(sender, "user", text)
+        if oca_response:
+            send_whatsapp_message(sender, oca_response)
+            _add_to_history(sender, "assistant", oca_response)
+        return
+
+    fiserv_handled, fiserv_response = _handle_fiserv_query(sender, text, history)
+    if fiserv_handled:
+        _add_to_history(sender, "user", text)
+        if fiserv_response:
+            send_whatsapp_message(sender, fiserv_response)
+            _add_to_history(sender, "assistant", fiserv_response)
+        return
+
+    _add_to_history(sender, "user", text)
+
     try:
-        text_resp, tool_call = process_text(text)
+        text_resp, tool_call = process_text(text, history)
         if tool_call:
             name = tool_call["name"]
             inp  = tool_call["input"]
             log.info(f"Tool call '{name}' para {_mask(sender)}: {inp}")
             if name == "agregar_chofer":
                 _cmd_add_chofer(sender, inp.get("nombre", ""))
+                _add_to_history(sender, "assistant", f"Agregué al chofer '{inp.get('nombre')}' al sistema.")
             elif name == "dar_baja_chofer":
                 _cmd_deactivate_chofer(sender, inp.get("nombre", ""))
+                _add_to_history(sender, "assistant", f"Dí de baja al chofer '{inp.get('nombre')}'.")
             elif name == "listar_choferes":
                 _cmd_list_choferes(sender)
+                _add_to_history(sender, "assistant", "Listé los choferes activos.")
             elif name == "agregar_empresa":
                 _cmd_init_add_empresa(sender, inp.get("nombre", ""))
+                _add_to_history(sender, "assistant", f"Iniciando alta de empresa '{inp.get('nombre')}'.")
             elif name == "dar_baja_empresa":
                 _cmd_deactivate_empresa(sender, inp.get("nombre", ""))
+                _add_to_history(sender, "assistant", f"Dí de baja a la empresa '{inp.get('nombre')}'.")
             elif name == "actualizar_rut_empresa":
                 _cmd_update_rut(sender, inp.get("nombre", ""), inp.get("rut", ""))
+                _add_to_history(sender, "assistant", f"Actualicé el RUT de '{inp.get('nombre')}' a {inp.get('rut')}.")
             elif name == "listar_empresas":
                 _cmd_list_empresas(sender)
+                _add_to_history(sender, "assistant", "Listé las empresas registradas.")
         else:
             send_whatsapp_message(sender, text_resp)
+            _add_to_history(sender, "assistant", text_resp)
         log.info(f"Mensaje de texto procesado para {_mask(sender)}")
     except Exception as e:
         log.error(f"Error procesando texto de {_mask(sender)}: {e}\n{traceback.format_exc()}")
