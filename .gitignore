@@ -1,5 +1,11 @@
 # Credentials — never commit
 .env
+gmail_credentials.json
+gmail_token.json
+
+# Runtime data — not source code
+fiserv_processed_emails.json
+fiserv_sheets_id.json
 
 # Database — contains real user data
 *.db
